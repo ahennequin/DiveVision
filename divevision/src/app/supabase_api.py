@@ -1,6 +1,7 @@
 import logging
 import os
 
+import httpx
 import storage3
 import supabase
 from dotenv import load_dotenv
@@ -22,7 +23,11 @@ _PAGE_SIZE = 1000
 
 _AUTH_ERRORS = (supabase.AuthApiError, supabase.AuthError)
 _STORAGE_ERRORS = (storage3.exceptions.StorageApiError, supabase.AuthApiError)
-_POSTGREST_ERRORS = (supabase.PostgrestAPIError, supabase.AuthApiError)
+_POSTGREST_ERRORS = (
+    supabase.PostgrestAPIError,
+    supabase.AuthApiError,
+    httpx.HTTPError,
+)
 
 
 def get_client() -> supabase.Client:

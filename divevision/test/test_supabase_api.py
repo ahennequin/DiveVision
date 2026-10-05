@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import httpx
 import pytest
 import storage3
 import supabase
@@ -196,6 +197,21 @@ def test_find_photo_raises_on_postgrest_error(mock_admin_client):
         supabase_api.find_photo("photo-1")
 
 
+@pytest.mark.parametrize(
+    "error",
+    [
+        httpx.ConnectError("unreachable"),
+        httpx.ReadTimeout("timed out"),
+        httpx.RemoteProtocolError("disconnected"),
+    ],
+)
+def test_find_photo_raises_on_transport_error(mock_admin_client, error):
+    query = mock_admin_client.table.return_value.select.return_value.eq.return_value
+    query.execute.side_effect = error
+    with pytest.raises(supabase_api.PhotoLookupError):
+        supabase_api.find_photo("photo-1")
+
+
 def _update_call(mock_admin_client, data):
     update = mock_admin_client.table.return_value.update
     update.return_value.eq.return_value.execute.return_value = SimpleNamespace(
@@ -232,6 +248,12 @@ def test_mark_photo_failed(mock_admin_client):
 def test_mark_photo_failed_postgrest_error(mock_admin_client):
     update = mock_admin_client.table.return_value.update
     update.return_value.eq.return_value.execute.side_effect = _postgrest_error()
+    assert supabase_api.mark_photo_failed("photo-1") is False
+
+
+def test_mark_photo_failed_transport_error(mock_admin_client):
+    update = mock_admin_client.table.return_value.update
+    update.return_value.eq.return_value.execute.side_effect = httpx.ConnectError("down")
     assert supabase_api.mark_photo_failed("photo-1") is False
 
 

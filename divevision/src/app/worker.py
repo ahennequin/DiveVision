@@ -23,7 +23,10 @@ from divevision.src.app.enhancement import (
 logger = logging.getLogger(__name__)
 
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
-LOOKUP_RETRY_DELAY = 10
+# Ride out a Supabase outage of ~25 minutes: 10s, 20s, 40s, ... capped at 5 min.
+MAX_TRIES = 10
+LOOKUP_RETRY_BASE_DELAY = 10
+LOOKUP_RETRY_MAX_DELAY = 300
 
 
 def processed_path_for(original_path: str) -> str:
@@ -31,19 +34,29 @@ def processed_path_for(original_path: str) -> str:
     return original_path.rsplit(".", 1)[0] + ".png"
 
 
-def process_photo(model, photo_id: str) -> str:
+def lookup_retry_delay(job_try: int) -> int:
+    return min(LOOKUP_RETRY_BASE_DELAY * 2 ** (job_try - 1), LOOKUP_RETRY_MAX_DELAY)
+
+
+def process_photo(model, photo_id: str, job_try: int = 1) -> str:
     """Enhance one photo and record the outcome on its `photos` row.
 
     Returns the final status ("completed", "failed", or "skipped" when the
     row no longer exists or was already finished). Never raises for a bad
     photo: any failure is recorded as `failed` instead of retried. Raises
-    `arq.worker.Retry` if the row cannot be read at all, so the job runs again.
+    `arq.worker.Retry` (with backoff) if the row cannot be read at all, so the
+    job runs again; on the last of `MAX_TRIES` it marks the row `failed`.
     """
     try:
         photo = supabase_api.find_photo(photo_id)
     except supabase_api.PhotoLookupError as e:
-        logger.warning("Could not read photo %s; retrying", photo_id)
-        raise Retry(defer=LOOKUP_RETRY_DELAY) from e
+        if job_try < MAX_TRIES:
+            logger.warning("Could not read photo %s; retrying", photo_id)
+            raise Retry(defer=lookup_retry_delay(job_try)) from e
+        logger.error("Could not read photo %s after %d tries", photo_id, job_try)
+        if not supabase_api.mark_photo_failed(photo_id):
+            logger.error("Could not mark photo %s failed; it stays stuck", photo_id)
+        return "failed"
     if photo is None:
         logger.info("Photo %s was deleted before it was processed", photo_id)
         return "skipped"
@@ -99,7 +112,9 @@ async def enhance_photo(ctx: dict, photo_id: str) -> str:
     """arq job: enhance the photo `photo_id` (job id is the photo id too)."""
     # Inference and supabase-py calls are blocking; keep them off the event loop
     # so arq can still heartbeat and enforce `job_timeout`.
-    return await asyncio.to_thread(process_photo, ctx["model"], photo_id)
+    return await asyncio.to_thread(
+        process_photo, ctx["model"], photo_id, ctx["job_try"]
+    )
 
 
 async def startup(ctx: dict) -> None:
@@ -113,3 +128,4 @@ class WorkerSettings:
     # One CPU-bound inference at a time per process; scale by adding workers.
     max_jobs = 1
     job_timeout = 300
+    max_tries = MAX_TRIES

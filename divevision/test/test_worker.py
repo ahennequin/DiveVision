@@ -176,6 +176,43 @@ def test_process_photo_retries_when_lookup_fails(photos, monkeypatch):
     assert photos["statuses"] == []
 
 
+def test_process_photo_backs_off_between_lookup_retries(photos, monkeypatch):
+    monkeypatch.setattr(supabase_api, "find_photo", _failing_lookup)
+
+    delays = []
+    for job_try in range(1, worker.MAX_TRIES):
+        with pytest.raises(Retry) as retry:
+            worker.process_photo(FakeModel(), PHOTO_ID, job_try)
+        delays.append(retry.value.defer_score)
+
+    assert delays == sorted(delays)
+    assert delays[0] < delays[-1] == worker.LOOKUP_RETRY_MAX_DELAY * 1000
+    assert sum(delays) / 1000 >= 20 * 60
+    assert photos["statuses"] == []
+
+
+def test_process_photo_marks_failed_on_last_lookup_try(photos, monkeypatch):
+    monkeypatch.setattr(supabase_api, "find_photo", _failing_lookup)
+    model = FakeModel()
+
+    assert worker.process_photo(model, PHOTO_ID, worker.MAX_TRIES) == "failed"
+    assert model.inputs == []
+    assert photos["statuses"] == ["failed"]
+
+
+def test_process_photo_logs_when_last_try_cannot_mark_failed(
+    photos, monkeypatch, caplog
+):
+    monkeypatch.setattr(supabase_api, "find_photo", _failing_lookup)
+    monkeypatch.setattr(supabase_api, "mark_photo_failed", lambda photo_id: False)
+
+    assert worker.process_photo(FakeModel(), PHOTO_ID, worker.MAX_TRIES) == "failed"
+    assert any(
+        record.levelname == "ERROR" and "stays stuck" in record.getMessage()
+        for record in caplog.records
+    )
+
+
 def test_process_photo_keeps_output_when_completion_and_lookup_fail(
     photos, monkeypatch
 ):
@@ -207,16 +244,25 @@ def test_process_photo_marks_failed_when_completion_fails_for_existing_row(
 def test_enhance_photo_job_uses_model_loaded_at_startup(photos, monkeypatch):
     model = FakeModel()
     monkeypatch.setattr(worker, "load_model", lambda: model)
-    ctx: dict = {}
+    ctx: dict = {"job_try": 1}
 
     asyncio.run(worker.startup(ctx))
     assert asyncio.run(worker.enhance_photo(ctx, PHOTO_ID)) == "completed"
     assert len(model.inputs) == 1
 
 
+def test_enhance_photo_job_gives_up_on_last_try(photos, monkeypatch):
+    monkeypatch.setattr(supabase_api, "find_photo", _failing_lookup)
+    ctx = {"model": FakeModel(), "job_try": worker.MAX_TRIES}
+
+    assert asyncio.run(worker.enhance_photo(ctx, PHOTO_ID)) == "failed"
+    assert photos["statuses"] == ["failed"]
+
+
 def test_worker_settings_register_the_job():
     assert worker.enhance_photo in worker.WorkerSettings.functions
     assert worker.WorkerSettings.on_startup is worker.startup
+    assert worker.WorkerSettings.max_tries == worker.MAX_TRIES
 
 
 # -- enhancement.enhance_image ---------------------------------------------------------
