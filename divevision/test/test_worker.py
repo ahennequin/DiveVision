@@ -186,7 +186,7 @@ def test_process_photo_backs_off_between_lookup_retries(photos, monkeypatch):
         delays.append(retry.value.defer_score)
 
     assert delays == sorted(delays)
-    assert delays[0] < delays[-1] == worker.LOOKUP_RETRY_MAX_DELAY * 1000
+    assert delays[0] < delays[-1] == worker.RETRY_MAX_DELAY * 1000
     assert sum(delays) / 1000 >= 20 * 60
     assert photos["statuses"] == []
 
@@ -224,21 +224,66 @@ def test_process_photo_keeps_output_when_completion_and_lookup_fail(
         supabase_api, "mark_photo_completed", completion_fails_then_lookup_fails
     )
 
-    assert worker.process_photo(FakeModel(), PHOTO_ID) == "failed"
-    assert photos["statuses"] == ["processing", "failed"]
+    with pytest.raises(Retry):
+        worker.process_photo(FakeModel(), PHOTO_ID)
+    assert photos["statuses"] == ["processing"]
     assert (supabase_api.PROCESSED_IMAGES_BUCKET, PROCESSED_PATH) in photos["objects"]
 
 
-def test_process_photo_marks_failed_when_completion_fails_for_existing_row(
+def test_process_photo_retries_when_completion_fails_then_completes(
+    photos, monkeypatch
+):
+    real_mark_completed = supabase_api.mark_photo_completed
+    monkeypatch.setattr(
+        supabase_api, "mark_photo_completed", lambda photo_id, processed_path: False
+    )
+    model = FakeModel()
+
+    with pytest.raises(Retry):
+        worker.process_photo(model, PHOTO_ID, 1)
+    assert photos["rows"][PHOTO_ID]["status"] == "processing"
+
+    monkeypatch.setattr(supabase_api, "mark_photo_completed", real_mark_completed)
+    assert worker.process_photo(model, PHOTO_ID, 2) == "completed"
+    assert photos["statuses"] == ["processing", "processing", "completed"]
+    assert len(model.inputs) == 2
+
+
+def test_process_photo_marks_failed_when_completion_fails_on_last_try(
     photos, monkeypatch
 ):
     monkeypatch.setattr(
         supabase_api, "mark_photo_completed", lambda photo_id, processed_path: False
     )
 
-    assert worker.process_photo(FakeModel(), PHOTO_ID) == "failed"
+    assert worker.process_photo(FakeModel(), PHOTO_ID, worker.MAX_TRIES) == "failed"
     assert photos["statuses"] == ["processing", "failed"]
     assert (supabase_api.PROCESSED_IMAGES_BUCKET, PROCESSED_PATH) in photos["objects"]
+
+
+def test_process_photo_retries_when_failed_status_cannot_be_written(
+    photos, monkeypatch
+):
+    photos["objects"].clear()
+    monkeypatch.setattr(supabase_api, "mark_photo_failed", lambda photo_id: False)
+
+    with pytest.raises(Retry) as retry:
+        worker.process_photo(FakeModel(), PHOTO_ID, 3)
+    assert retry.value.defer_score == worker.retry_delay(3) * 1000
+    assert photos["rows"][PHOTO_ID]["status"] == "processing"
+
+
+def test_process_photo_logs_when_failed_status_cannot_be_written_on_last_try(
+    photos, monkeypatch, caplog
+):
+    photos["objects"].clear()
+    monkeypatch.setattr(supabase_api, "mark_photo_failed", lambda photo_id: False)
+
+    assert worker.process_photo(FakeModel(), PHOTO_ID, worker.MAX_TRIES) == "failed"
+    assert any(
+        record.levelname == "ERROR" and "stays stuck" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 def test_enhance_photo_job_uses_model_loaded_at_startup(photos, monkeypatch):

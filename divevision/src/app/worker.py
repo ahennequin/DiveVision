@@ -25,8 +25,8 @@ logger = logging.getLogger(__name__)
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
 # Ride out a Supabase outage of ~25 minutes: 10s, 20s, 40s, ... capped at 5 min.
 MAX_TRIES = 10
-LOOKUP_RETRY_BASE_DELAY = 10
-LOOKUP_RETRY_MAX_DELAY = 300
+RETRY_BASE_DELAY = 10
+RETRY_MAX_DELAY = 300
 
 
 def processed_path_for(original_path: str) -> str:
@@ -34,8 +34,22 @@ def processed_path_for(original_path: str) -> str:
     return original_path.rsplit(".", 1)[0] + ".png"
 
 
-def lookup_retry_delay(job_try: int) -> int:
-    return min(LOOKUP_RETRY_BASE_DELAY * 2 ** (job_try - 1), LOOKUP_RETRY_MAX_DELAY)
+def retry_delay(job_try: int) -> int:
+    return min(RETRY_BASE_DELAY * 2 ** (job_try - 1), RETRY_MAX_DELAY)
+
+
+def _retry_or_fail(photo_id: str, job_try: int) -> str:
+    """Supabase is unavailable: retry the job later, or give up on the last try.
+
+    Giving up makes a best-effort attempt to record `failed`.
+    """
+    if job_try < MAX_TRIES:
+        logger.warning("Supabase unavailable for photo %s; retrying", photo_id)
+        raise Retry(defer=retry_delay(job_try))
+    logger.error("Giving up on photo %s after %d tries", photo_id, job_try)
+    if not supabase_api.mark_photo_failed(photo_id):
+        logger.error("Could not mark photo %s failed; it stays stuck", photo_id)
+    return "failed"
 
 
 def process_photo(model, photo_id: str, job_try: int = 1) -> str:
@@ -44,26 +58,22 @@ def process_photo(model, photo_id: str, job_try: int = 1) -> str:
     Returns the final status ("completed", "failed", or "skipped" when the
     row no longer exists or was already finished). Never raises for a bad
     photo: any failure is recorded as `failed` instead of retried. Raises
-    `arq.worker.Retry` (with backoff) if the row cannot be read at all, so the
-    job runs again; on the last of `MAX_TRIES` it marks the row `failed`.
+    `arq.worker.Retry` (with backoff) if Supabase can't be read or the final
+    status can't be written, so the whole job runs again; on the last of
+    `MAX_TRIES` it marks the row `failed` if it still can.
     """
     try:
         photo = supabase_api.find_photo(photo_id)
-    except supabase_api.PhotoLookupError as e:
-        if job_try < MAX_TRIES:
-            logger.warning("Could not read photo %s; retrying", photo_id)
-            raise Retry(defer=lookup_retry_delay(job_try)) from e
-        logger.error("Could not read photo %s after %d tries", photo_id, job_try)
-        if not supabase_api.mark_photo_failed(photo_id):
-            logger.error("Could not mark photo %s failed; it stays stuck", photo_id)
-        return "failed"
+    except supabase_api.PhotoLookupError:
+        return _retry_or_fail(photo_id, job_try)
     if photo is None:
         logger.info("Photo %s was deleted before it was processed", photo_id)
         return "skipped"
     if photo["status"] in ("completed", "failed"):
         return "skipped"
 
-    supabase_api.mark_photo_processing(photo_id)
+    if not supabase_api.mark_photo_processing(photo_id):
+        logger.warning("Could not mark photo %s processing", photo_id)
 
     try:
         original = supabase_api.download_image(
@@ -85,16 +95,16 @@ def process_photo(model, photo_id: str, job_try: int = 1) -> str:
             raise RuntimeError("could not store the enhanced photo")
     except Exception:
         logger.exception("Enhancement failed for photo %s", photo_id)
-        supabase_api.mark_photo_failed(photo_id)
-        return "failed"
+        if supabase_api.mark_photo_failed(photo_id):
+            return "failed"
+        return _retry_or_fail(photo_id, job_try)
 
     if supabase_api.mark_photo_completed(photo_id, processed_path):
         return "completed"
 
     # The row vanished mid-job (photo or account deleted): don't leave an
     # orphaned enhanced image behind. If it still exists (or we can't tell),
-    # the update itself failed, so surface that as `failed` rather than leave
-    # it `processing`.
+    # the update itself failed, so retry rather than leave it `processing`.
     try:
         row_gone = supabase_api.find_photo(photo_id) is None
     except supabase_api.PhotoLookupError:
@@ -104,8 +114,7 @@ def process_photo(model, photo_id: str, job_try: int = 1) -> str:
             supabase_api.PROCESSED_IMAGES_BUCKET, [processed_path]
         )
         return "skipped"
-    supabase_api.mark_photo_failed(photo_id)
-    return "failed"
+    return _retry_or_fail(photo_id, job_try)
 
 
 async def enhance_photo(ctx: dict, photo_id: str) -> str:
