@@ -7,9 +7,9 @@ DiveVision has two current strands of work — see `README.md` for the full pict
 
 1. **Experiment workflow**: testing/comparing underwater image enhancement models (U-Shape
    Transformer, CE-VAE), benchmarked via MLflow on the LSUI/UIEB datasets.
-2. **App serving the U-Shape model**: backend only so far — FastAPI (`divevision/src/app/main.py`)
-   plus an arq enhancement worker (`divevision/src/app/worker.py`). No Expo/mobile/web client,
-   social features, or geolocation exist yet (client is issue #17). Don't imply otherwise.
+2. **App serving the U-Shape model**: FastAPI (`divevision/src/app/main.py`) plus an arq
+   enhancement worker (`divevision/src/app/worker.py`), and one Expo client in `client/` (web
+   first; not yet published to app stores). No social features or geolocation exist yet.
 
 ## Repo layout
 
@@ -24,13 +24,19 @@ DiveVision has two current strands of work — see `README.md` for the full pict
   `enhancement.py` (the one function that runs the model on a photo), `supabase_api.py`.
 - `divevision/test/` — pytest suite for models, the API, and the worker.
 - `divevision/notebooks/test_model.ipynb` — manual smoke test for a model.
+- `client/` — the Expo client; its own `AGENTS.md`/`README.md` cover screens, data flows and
+  commands.
 
 ## Running things
 
 - Tests: `poetry run pytest`
 - Benchmark: see "Running the benchmark" in `README.md` (Docker Compose-based).
 - API + worker + Redis: `docker compose up api worker` (or see README's "Running the FastAPI
-  server and worker").
+  server and worker"); add `client` for the web build on :8081.
+- Client checks: `npm run lint|typecheck|test|api:check` in `client/`.
+- Changing an API route or model: run `npm run api:update` in `client/` to regenerate
+  `client/openapi.json` and `client/src/api/schema.d.ts`; pytest and the Client CI fail if
+  either is stale.
 - RLS integration tests: `divevision/test/test_rls_integration.py` (skipped unless pointed at a
   local `supabase start` stack; its docstring has the command).
 

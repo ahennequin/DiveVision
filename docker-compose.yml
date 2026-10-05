@@ -44,6 +44,24 @@ services:
       # Egress to the Supabase project
       - frontend-network
 
+  # The Expo client's static web build (client/), served at http://localhost:8081
+  # - the api's default CORS origin. Local-only for now. The bundle only ever
+  # holds public values: the publishable (anon) key, never the service-role key.
+  # Rebuild after changing them: `docker compose up --build client`.
+  client:
+    build:
+      context: ./client
+      args:
+        EXPO_PUBLIC_SUPABASE_URL: ${SUPABASE_URL}
+        EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY: ${SUPABASE_KEY}
+        # Where the browser reaches the api (not a compose-internal hostname).
+        EXPO_PUBLIC_API_URL: ${CLIENT_API_URL:-http://localhost:8000}
+    ports:
+      - "8081:80"
+    restart: unless-stopped
+    networks:
+      - frontend-network
+
   # Job queue between the api and the worker; only reachable on queue-network.
   redis:
     image: redis:7-alpine

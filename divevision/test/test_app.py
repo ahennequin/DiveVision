@@ -354,3 +354,13 @@ def test_leaderboard_accepts_correct_secret(monkeypatch):
 
     assert response.status_code == 201
     assert recorded == [("U-Shape", "UIEB", "ssim", 0.9)]
+
+
+def test_openapi_snapshot_is_current():
+    """The Expo client's API types are generated from this committed schema."""
+    from divevision.src.app import export_openapi
+
+    committed = export_openapi.DEFAULT_PATH.read_text()
+    assert (
+        committed == export_openapi.render_schema()
+    ), "client/openapi.json is stale: run `npm run api:update` in client/"

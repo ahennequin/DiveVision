@@ -1,0 +1,63 @@
+{
+  "name": "divevision-client",
+  "version": "1.0.0",
+  "main": "expo-router/entry",
+  "dependencies": {
+    "@supabase/supabase-js": "^2.117.2",
+    "expo": "~57.0.26",
+    "expo-constants": "~57.0.20",
+    "expo-image-picker": "~57.0.20",
+    "expo-linking": "~57.0.11",
+    "expo-router": "~57.0.24",
+    "expo-sqlite": "~57.0.3",
+    "expo-status-bar": "~57.0.1",
+    "openapi-fetch": "^0.17.0",
+    "react": "19.2.3",
+    "react-dom": "19.2.3",
+    "react-native": "0.86.3",
+    "react-native-safe-area-context": "~5.7.0",
+    "react-native-screens": "~4.26.0",
+    "react-native-web": "^0.21.2"
+  },
+  "devDependencies": {
+    "@testing-library/react-native": "^14.0.1",
+    "@types/jest": "29.5.14",
+    "@types/react": "~19.2.2",
+    "eslint": "^9.0.0",
+    "eslint-config-expo": "~57.0.2",
+    "jest": "~29.7.0",
+    "jest-expo": "~57.0.5",
+    "openapi-typescript": "^7.13.0",
+    "test-renderer": "~1.2.0",
+    "typescript": "~6.0.3"
+  },
+  "scripts": {
+    "start": "expo start",
+    "android": "expo start --android",
+    "ios": "expo start --ios",
+    "web": "expo start --web",
+    "build:web": "expo export --platform web",
+    "lint": "expo lint",
+    "typecheck": "tsc --noEmit",
+    "test": "jest",
+    "api:export": "cd .. && poetry run python -m divevision.src.app.export_openapi",
+    "api:generate": "openapi-typescript openapi.json --output src/api/schema.d.ts",
+    "api:check": "node scripts/check-api-schema.mjs",
+    "api:update": "npm run api:export && npm run api:generate"
+  },
+  "private": true,
+  "overrides": {
+    "openapi-typescript": {
+      "typescript": "$typescript"
+    }
+  },
+  "jest": {
+    "preset": "jest-expo",
+    "transformIgnorePatterns": [
+      "node_modules/(?!((jest-)?react-native|@react-native(-community)?)|expo(nent)?|@expo(nent)?/.*|@expo-google-fonts/.*|react-navigation|@react-navigation/.*|@sentry/react-native|native-base|react-native-svg)"
+    ],
+    "setupFiles": [
+      "<rootDir>/jest.setup.ts"
+    ]
+  }
+}

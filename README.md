@@ -7,9 +7,10 @@ has two current strands of work:
    (currently [U-Shape Transformer](https://github.com/LintaoPeng/U-shape_Transformer_for_Underwater_Image_Enhancement)
    and [CE-VAE](https://github.com/iN1k1/ce-vae-underwater-image-enhancement)), benchmarked with
    MLflow against the LSUI and UIEB datasets.
-2. **Mobile app serving the tested models** — very early stage. The current goal is simply to
-   serve a model's output to a mobile client. Social-network features and photo geolocation are
-   **future work**, not part of the current scope.
+2. **App serving the tested models** — early stage: a backend plus one Expo client (web first,
+   mobile later) where Users upload underwater photos and compare them with their U-Shape
+   Transformer enhancement. Social-network features and photo geolocation are **future work**,
+   not part of the current scope.
 
 ## What exists today
 
@@ -26,14 +27,18 @@ has two current strands of work:
   U-Shape Transformer enhancement, return the photo id at once), `DELETE /photos/{id}/`,
   `DELETE /account/` (full GDPR account erasure), and a shared-secret-gated
   `POST /leaderboard/` used by the benchmark pipeline to record scores. See
-  `docs/adr/0002-async-enhancement-and-rls-boundary.md`. No client consumes it yet.
+  `docs/adr/0002-async-enhancement-and-rls-boundary.md`.
+- **An Expo client** (`client/`, web first): sign up/in, upload a photo, follow its status live,
+  compare before/after, browse a gallery of my photos, delete a photo or my account. Its typed
+  API client is generated from FastAPI's OpenAPI schema. See `client/README.md`.
 - **Tests** for the models and the FastAPI app (`divevision/test/`).
 
 ## Roadmap (not implemented yet)
 
 - Training a model from scratch (the README previously implied this existed — it does not; only
   inference over pretrained checkpoints is implemented).
-- A single Expo client (web first, then mobile) consuming the API and Supabase (issue #17).
+- Publishing the Expo client to the app stores (EAS Build/Submit), hosting its web build,
+  choosing among Enhancement Models in the app, and a leaderboard page.
 - Social-network features and photo geolocation — explicitly out of scope until the above lands.
 
 ## Installation
@@ -105,7 +110,14 @@ poetry run arq divevision.src.app.worker.WorkerSettings
 All endpoints except `/leaderboard/` need `Authorization: Bearer <Supabase access token>`.
 `POST /photos/` (multipart `file`, JPEG or PNG) answers `202 {"id": ..., "status": "pending"}`;
 the worker then sets the photo's `photos.status` to `completed` (with `processed_path` in the
-`processedimages` bucket) or `failed`. There is no mobile or web client in this repository yet.
+`processedimages` bucket) or `failed`.
+
+## Running the client
+
+See `client/README.md`. In short: fill `SUPABASE_URL`, the publishable `SUPABASE_KEY` and
+`CLIENT_API_URL` in `.env`, then `docker compose up --build api worker client` serves the web
+build at http://localhost:8081 (the API's default CORS origin). For development, copy
+`client/.env.example` to `client/.env` and run `npm ci && npm run web` in `client/`.
 
 ## Running tests
 
@@ -113,7 +125,10 @@ the worker then sets the photo's `photos.status` to `completed` (with `processed
 poetry run pytest
 ```
 
-The default run is offline. `divevision/test/test_rls_integration.py` proves the owner-only
+The default run is offline; it also fails if `client/openapi.json` no longer matches the API
+(regenerate with `npm run api:update` in `client/`). The client's own offline checks are
+`npm run lint`, `npm run typecheck`, `npm test` and `npm run api:check` in `client/`.
+`divevision/test/test_rls_integration.py` proves the owner-only
 access rules (rows, storage, Realtime) against a local Supabase stack and skips unless
 `SUPABASE_TEST_URL`, `SUPABASE_TEST_ANON_KEY` and `SUPABASE_TEST_SERVICE_ROLE_KEY` are set —
 see its docstring for running it after `supabase start`.

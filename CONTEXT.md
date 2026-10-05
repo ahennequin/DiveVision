@@ -6,8 +6,8 @@ DiveVision has two strands, sharing the image and model vocabulary below:
   benchmark datasets, model wrappers around third-party architectures, quality metrics, and
   MLflow-based experiment tracking;
 - an app that serves one Enhancement Model to Users: a FastAPI backend plus an arq worker,
-  backed by Supabase (auth, storage, the `photos` table). Its client (Expo, web first) is not
-  built yet.
+  backed by Supabase (auth, storage, the `photos` table), and one Expo client (`client/`, web
+  first, mobile later).
 
 ## Language
 
