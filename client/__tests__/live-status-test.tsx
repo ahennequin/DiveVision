@@ -1,6 +1,7 @@
 import { act, renderHook, waitFor } from '@testing-library/react-native';
 
 import { notifyPhotoDeleted } from '@/lib/photoEvents';
+import { PAGE_SIZE } from '@/lib/photos';
 import { useMyPhotos } from '@/lib/useMyPhotos';
 import { usePhoto } from '@/lib/usePhoto';
 import { OTHER_USER_ID, USER_ID, fakeSupabase, makePhoto } from '@/test-utils/fakeSupabase';
@@ -44,6 +45,24 @@ describe('useMyPhotos', () => {
     await waitFor(() => expect(result.current.photos).toHaveLength(1));
     await act(async () => notifyPhotoDeleted(pending.id));
     expect(result.current.photos).toEqual([]);
+  });
+
+  it('loads the next page without skipping a photo after one is deleted', async () => {
+    const rows = Array.from({ length: PAGE_SIZE + 6 }, (_, i) =>
+      makePhoto({ id: `cccccccc-0000-4000-8000-${String(i).padStart(12, '0')}` }),
+    );
+    mockSupabase = fakeSupabase(rows.slice());
+    const { result } = await renderHook(() => useMyPhotos(USER_ID));
+    await waitFor(() => expect(result.current.photos).toHaveLength(PAGE_SIZE));
+
+    const deleted = rows[2];
+    mockSupabase.rows.splice(mockSupabase.rows.indexOf(deleted), 1);
+    await act(async () => notifyPhotoDeleted(deleted.id));
+    await act(async () => result.current.loadMore());
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    expect(result.current.photos).toEqual(rows.filter((p) => p !== deleted));
+    expect(result.current.hasMore).toBe(false);
   });
 });
 

@@ -31,6 +31,10 @@ export function useMyPhotos(userId: string): MyPhotos {
   const loaded = useRef(0);
   const request = useRef(0);
 
+  useEffect(() => {
+    loaded.current = photos.length;
+  }, [photos]);
+
   const fetchPage = useCallback(
     async (offset: number, limit: number) => {
       const supabase = getSupabase();
@@ -47,7 +51,6 @@ export function useMyPhotos(userId: string): MyPhotos {
     fetchPage(0, limit)
       .then(({ page, urls }) => {
         if (id !== request.current) return;
-        loaded.current = page.length;
         setPhotos(page);
         setThumbnails(urls);
         setHasMore(page.length === limit);
@@ -67,7 +70,6 @@ export function useMyPhotos(userId: string): MyPhotos {
     fetchPage(loaded.current, PAGE_SIZE)
       .then(({ page, urls }) => {
         if (id !== request.current) return;
-        loaded.current += page.length;
         setPhotos((current) => {
           const known = new Set(current.map((p) => p.id));
           return [...current, ...page.filter((p) => !known.has(p.id))];
