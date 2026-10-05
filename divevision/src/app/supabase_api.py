@@ -1,12 +1,10 @@
-from io import BytesIO
 import logging
 import os
-import uuid
 
+import httpx
 import storage3
 import supabase
 from dotenv import load_dotenv
-from PIL import Image
 
 logger = logging.getLogger(__name__)
 
@@ -19,16 +17,30 @@ SUPABASE_SERVICE_ROLE_KEY: str = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 IMAGES_BUCKET = "images"
 PROCESSED_IMAGES_BUCKET = "processedimages"
 
+
+def processed_path_for(original_path: str) -> str:
+    """`<user_id>/<photo_id>.<ext>` -> `<user_id>/<photo_id>.png`."""
+    return original_path.rsplit(".", 1)[0] + ".png"
+
+
+# PostgREST's `max_rows` (supabase/config.toml) and Storage's per-request
+# remove limit are both 1000.
+_PAGE_SIZE = 1000
+
+_AUTH_ERRORS = (supabase.AuthApiError, supabase.AuthError)
 _STORAGE_ERRORS = (storage3.exceptions.StorageApiError, supabase.AuthApiError)
-_POSTGREST_ERRORS = (supabase.PostgrestAPIError, supabase.AuthApiError)
+_POSTGREST_ERRORS = (
+    supabase.PostgrestAPIError,
+    supabase.AuthApiError,
+    httpx.HTTPError,
+)
 
 
 def get_client() -> supabase.Client:
     """Build a fresh, unauthenticated Supabase client using the public anon key.
 
-    A new client is created per call (rather than sharing one module-level
-    client) so that signing in as one user never leaks that session into a
-    concurrent request for another user.
+    Only used to verify a caller's access token. A new client is created per
+    call so no auth state is ever shared between concurrent requests.
     """
     return supabase.create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -36,154 +48,72 @@ def get_client() -> supabase.Client:
 def get_admin_client() -> supabase.Client:
     """Build a client authenticated with the service-role key.
 
-    Only used server-side for operations that have no non-admin equivalent
-    (deleting an auth user, writing leaderboard rows outside any user
-    session). This key must never be handed to a caller outside the backend.
+    Clients have read-only, owner-scoped access to `photos` and both buckets
+    (see supabase/migrations/), so every write - by the API on behalf of a
+    verified user, or by the worker after that user's token has expired -
+    goes through this client. The key bypasses RLS and must never be handed
+    to a caller outside the backend.
     """
     return supabase.create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 
-def _client_for_session(access_token: str, refresh_token: str) -> supabase.Client:
-    client = get_client()
-    client.auth.set_session(access_token, refresh_token)
-    return client
+def get_user_id(access_token: str) -> str | None:
+    """Verify a Supabase access token with Supabase Auth and return its user id.
 
-
-def _not_logged_in_error() -> supabase.AuthApiError:
-    return supabase.AuthApiError(
-        message="User is not logged in", status=401, code="session_not_found"
-    )
-
-
-def create_user(
-    mail: str,
-    password: str,
-) -> bool:
-    try:
-        get_client().auth.sign_up(
-            {
-                "email": mail,
-                "password": password,
-            }
-        )
-    except (supabase.AuthApiError, supabase.AuthInvalidCredentialsError) as e:
-        logger.error(e)
-        return False
-    else:
-        return True
-
-
-def sign_in_user(
-    mail: str,
-    password: str,
-) -> dict | None:
-    """Sign in and return the session tokens the caller needs for later calls.
-
-    Returns a dict with `access_token`, `refresh_token` and `user_id`, or
-    None if authentication failed.
+    Returns None if the token is invalid, expired, or revoked.
     """
     try:
-        response = get_client().auth.sign_in_with_password(
-            {
-                "email": mail,
-                "password": password,
-            }
-        )
-    except supabase.AuthApiError as e:
-        logger.error(e)
+        response = get_client().auth.get_user(access_token)
+    except _AUTH_ERRORS as e:
+        logger.info("Rejected access token: %s", e)
         return None
 
-    if response.session is None or response.user is None:
+    if response is None or response.user is None:
         return None
-
-    return {
-        "access_token": response.session.access_token,
-        "refresh_token": response.session.refresh_token,
-        "user_id": response.user.id,
-    }
+    return response.user.id
 
 
-def _detect_content_type(file: bytes) -> str:
-    """Sniff the actual image format from its bytes rather than assuming one."""
-    try:
-        with Image.open(BytesIO(file)) as image:
-            return image.get_format_mimetype() or "application/octet-stream"
-    except OSError:
-        return "application/octet-stream"
+# -- storage -------------------------------------------------------------------
 
 
 def upload_image(
-    access_token: str,
-    refresh_token: str,
     file: bytes,
     bucket: str,
-    path: str | None = None,
-) -> str | None:
-    """Upload image bytes as the signed-in user, returning the remote storage path.
-
-    If `path` is omitted, a fresh `<user_id>/<uuid>.jpg` path is generated;
-    pass it explicitly to store the processed result under the same path as
-    the original it was derived from.
-    """
+    path: str,
+    content_type: str,
+    upsert: bool = False,
+) -> bool:
+    """Upload image bytes to `bucket` at `path` (`<user_id>/<file>`)."""
     try:
-        client = _client_for_session(access_token, refresh_token)
-
-        session = client.auth.get_session()
-        if session is None:
-            raise _not_logged_in_error()
-
-        remote_path = path or f"{session.user.id}/{uuid.uuid4()}.jpg"
-        client.storage.from_(bucket).upload(
-            path=remote_path,
+        get_admin_client().storage.from_(bucket).upload(
+            path=path,
             file=file,
             file_options={
-                "content-type": _detect_content_type(file),
+                "content-type": content_type,
+                "upsert": "true" if upsert else "false",
             },
         )
     except _STORAGE_ERRORS as e:
         logger.error(e)
-        return None
+        return False
     else:
-        return remote_path
+        return True
 
 
-def download_image(
-    access_token: str,
-    refresh_token: str,
-    remotepath: str,
-    bucket: str,
-) -> Image.Image | None:
-    """Download an image as the signed-in user."""
+def download_image(bucket: str, path: str) -> bytes | None:
     try:
-        client = _client_for_session(access_token, refresh_token)
-
-        session = client.auth.get_session()
-        if session is None:
-            raise _not_logged_in_error()
-
-        response: bytes = client.storage.from_(bucket).download(remotepath)
-        image = Image.open(BytesIO(response))
+        return get_admin_client().storage.from_(bucket).download(path)
     except _STORAGE_ERRORS as e:
         logger.error(e)
         return None
-    else:
-        return image
 
 
-def delete_image(
-    access_token: str,
-    refresh_token: str,
-    remotepath: str,
-    bucket: str,
-) -> bool:
+def delete_images(bucket: str, paths: list[str]) -> bool:
+    bucket_api = get_admin_client().storage.from_(bucket)
     try:
-        client = _client_for_session(access_token, refresh_token)
-
-        session = client.auth.get_session()
-        if session is None:
-            raise _not_logged_in_error()
-
-        client.storage.from_(bucket).remove([remotepath])
+        # Storage caps how many objects one remove request may name.
+        for start in range(0, len(paths), _PAGE_SIZE):
+            bucket_api.remove(paths[start : start + _PAGE_SIZE])
     except _STORAGE_ERRORS as e:
         logger.error(e)
         return False
@@ -191,49 +121,114 @@ def delete_image(
         return True
 
 
+def _delete_photo_objects(photos: list[dict]) -> None:
+    """Best-effort removal of the original and enhanced objects of `photos`.
+
+    The enhanced object is also removed at its derived path, since the worker
+    uploads it before `processed_path` is recorded on the row.
+    """
+    originals = [p["original_path"] for p in photos if p["original_path"]]
+    delete_images(IMAGES_BUCKET, originals)
+    processed = {processed_path_for(path) for path in originals}
+    processed.update(p["processed_path"] for p in photos if p["processed_path"])
+    delete_images(PROCESSED_IMAGES_BUCKET, sorted(processed))
+
+
+# -- photos table ----------------------------------------------------------------
+
+
 def create_photo(
-    access_token: str,
-    refresh_token: str,
+    photo_id: str,
+    user_id: str,
     original_path: str,
     model_name: str,
-) -> str | None:
-    """Insert a `photos` row (status "processing") and return its id."""
+) -> bool:
+    """Insert a `pending` photos row for `user_id`."""
     try:
-        client = _client_for_session(access_token, refresh_token)
+        get_admin_client().table("photos").insert(
+            {
+                "id": photo_id,
+                "user_id": user_id,
+                "original_path": original_path,
+                "model_name": model_name,
+                "status": "pending",
+            }
+        ).execute()
+    except _POSTGREST_ERRORS as e:
+        logger.error(e)
+        return False
+    else:
+        return True
 
-        session = client.auth.get_session()
-        if session is None:
-            raise _not_logged_in_error()
 
+class PhotoLookupError(Exception):
+    """Reading a photos row failed, so whether it exists is unknown."""
+
+
+def _photo_query(photo_id: str):
+    return get_admin_client().table("photos").select("*").eq("id", photo_id)
+
+
+def find_photo(photo_id: str) -> dict | None:
+    """Fetch a photos row for the worker, regardless of owner.
+
+    Returns None only when the row is confirmed missing; raises
+    `PhotoLookupError` when the lookup itself fails.
+    """
+    try:
+        response = _photo_query(photo_id).execute()
+    except _POSTGREST_ERRORS as e:
+        raise PhotoLookupError(photo_id) from e
+    return response.data[0] if response.data else None
+
+
+def get_photo(photo_id: str, user_id: str) -> dict | None:
+    """Fetch a photos row only if it belongs to `user_id`, else None.
+
+    The admin client bypasses RLS, so this owner filter is the access check.
+    """
+    try:
+        response = _photo_query(photo_id).eq("user_id", user_id).execute()
+    except _POSTGREST_ERRORS as e:
+        logger.error(e)
+        return None
+    return response.data[0] if response.data else None
+
+
+def _update_photo(photo_id: str, values: dict) -> bool:
+    """Update a photos row; False if it errored or no longer exists."""
+    try:
         response = (
-            client.table("photos")
-            .insert(
-                {
-                    "user_id": session.user.id,
-                    "original_path": original_path,
-                    "model_name": model_name,
-                }
-            )
+            get_admin_client()
+            .table("photos")
+            .update(values)
+            .eq("id", photo_id)
             .execute()
         )
     except _POSTGREST_ERRORS as e:
         logger.error(e)
-        return None
+        return False
     else:
-        return response.data[0]["id"]
+        return bool(response.data)
 
 
-def mark_photo_completed(
-    access_token: str,
-    refresh_token: str,
-    photo_id: str,
-    processed_path: str,
-) -> bool:
+def mark_photo_processing(photo_id: str) -> bool:
+    return _update_photo(photo_id, {"status": "processing"})
+
+
+def mark_photo_completed(photo_id: str, processed_path: str) -> bool:
+    return _update_photo(
+        photo_id, {"status": "completed", "processed_path": processed_path}
+    )
+
+
+def mark_photo_failed(photo_id: str) -> bool:
+    return _update_photo(photo_id, {"status": "failed"})
+
+
+def delete_photo_row(photo_id: str) -> bool:
     try:
-        client = _client_for_session(access_token, refresh_token)
-        client.table("photos").update(
-            {"status": "completed", "processed_path": processed_path}
-        ).eq("id", photo_id).execute()
+        get_admin_client().table("photos").delete().eq("id", photo_id).execute()
     except _POSTGREST_ERRORS as e:
         logger.error(e)
         return False
@@ -241,115 +236,61 @@ def mark_photo_completed(
         return True
 
 
-def mark_photo_failed(
-    access_token: str,
-    refresh_token: str,
-    photo_id: str,
-) -> bool:
-    try:
-        client = _client_for_session(access_token, refresh_token)
-        client.table("photos").update({"status": "failed"}).eq("id", photo_id).execute()
-    except _POSTGREST_ERRORS as e:
-        logger.error(e)
-        return False
-    else:
-        return True
+def delete_photo(photo_id: str, user_id: str) -> bool:
+    """Delete one of `user_id`'s photos: its row, then both storage objects.
 
-
-def get_photo(
-    access_token: str,
-    refresh_token: str,
-    photo_id: str,
-) -> dict | None:
-    """Fetch a photo row. RLS scopes this to rows owned by the signed-in user."""
-    try:
-        client = _client_for_session(access_token, refresh_token)
-        response = client.table("photos").select("*").eq("id", photo_id).execute()
-    except _POSTGREST_ERRORS as e:
-        logger.error(e)
-        return None
-
-    if not response.data:
-        return None
-    return response.data[0]
-
-
-def delete_photo(
-    access_token: str,
-    refresh_token: str,
-    photo_id: str,
-) -> bool:
-    """Delete one photo: both storage objects (if present) and its row."""
-    photo = get_photo(access_token, refresh_token, photo_id)
-    if photo is None:
+    The row goes first so an in-flight Enhancement Job fails to complete it
+    and removes its own output. Returns False if the photo does not exist,
+    belongs to someone else, or its row could not be deleted.
+    """
+    photo = get_photo(photo_id, user_id=user_id)
+    if photo is None or not delete_photo_row(photo_id):
         return False
 
-    if photo["original_path"]:
-        delete_image(access_token, refresh_token, photo["original_path"], IMAGES_BUCKET)
-    if photo["processed_path"]:
-        delete_image(
-            access_token,
-            refresh_token,
-            photo["processed_path"],
-            PROCESSED_IMAGES_BUCKET,
-        )
-
-    try:
-        client = _client_for_session(access_token, refresh_token)
-        client.table("photos").delete().eq("id", photo_id).execute()
-    except _POSTGREST_ERRORS as e:
-        logger.error(e)
-        return False
-    else:
-        return True
+    _delete_photo_objects([photo])
+    return True
 
 
-def delete_account(
-    access_token: str,
-    refresh_token: str,
-) -> bool:
-    """Erase a user: every photo's storage objects, then the auth user itself.
+def delete_account(user_id: str) -> bool:
+    """Erase a user: the auth user itself, then every photo's storage objects.
 
     Deleting the auth user cascades (via the `photos.user_id` foreign key)
-    to remove every remaining `photos` row, so rows do not need to be
-    deleted one by one here - only the storage objects, which have no such
-    cascade.
+    to remove every `photos` row, so rows do not need to be deleted one by
+    one here - only the storage objects, which have no such cascade. Their
+    paths are read first, and the rows go before the objects so an in-flight
+    Enhancement Job fails to complete and removes its own output.
     """
+    client = get_admin_client()
+    photos: list[dict] = []
     try:
-        client = _client_for_session(access_token, refresh_token)
-
-        session = client.auth.get_session()
-        if session is None:
-            raise _not_logged_in_error()
-        user_id = session.user.id
-
-        photos = (
-            client.table("photos").select("original_path, processed_path").execute()
-        )
+        # PostgREST caps each response (`max_rows`), so page through them all.
+        while True:
+            page = (
+                client.table("photos")
+                .select("original_path, processed_path")
+                .eq("user_id", user_id)
+                .order("id")
+                .range(len(photos), len(photos) + _PAGE_SIZE - 1)
+                .execute()
+            )
+            photos.extend(page.data)
+            if len(page.data) < _PAGE_SIZE:
+                break
     except _POSTGREST_ERRORS as e:
         logger.error(e)
         return False
 
-    for photo in photos.data:
-        if photo["original_path"]:
-            delete_image(
-                access_token, refresh_token, photo["original_path"], IMAGES_BUCKET
-            )
-        if photo["processed_path"]:
-            delete_image(
-                access_token,
-                refresh_token,
-                photo["processed_path"],
-                PROCESSED_IMAGES_BUCKET,
-            )
-
     try:
-        get_admin_client().auth.admin.delete_user(user_id)
-    except supabase.AuthApiError as e:
+        client.auth.admin.delete_user(user_id)
+    except _AUTH_ERRORS as e:
         logger.error(e)
         return False
-    else:
-        return True
+
+    _delete_photo_objects(photos)
+    return True
+
+
+# -- leaderboard -------------------------------------------------------------------
 
 
 def insert_leaderboard_entry(

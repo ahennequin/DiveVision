@@ -1,11 +1,13 @@
 # DiveVision — Underwater Image Enhancement
 
-DiveVision's current, code-backed scope is a research workflow for testing and comparing
-underwater image enhancement models: paired benchmark datasets, model wrappers around
-third-party architectures, quality metrics, and MLflow-based experiment tracking. The
-mobile app / web app / FastAPI-serving strand mentioned in the README is out of scope for
-this model — today it is a single unwrapped endpoint with no domain vocabulary of its own
-yet (see "Out of scope" below).
+DiveVision has two strands, sharing the image and model vocabulary below:
+
+- a research workflow for testing and comparing underwater image enhancement models: paired
+  benchmark datasets, model wrappers around third-party architectures, quality metrics, and
+  MLflow-based experiment tracking;
+- an app that serves one Enhancement Model to Users: a FastAPI backend plus an arq worker,
+  backed by Supabase (auth, storage, the `photos` table). Its client (Expo, web first) is not
+  built yet.
 
 ## Language
 
@@ -73,10 +75,40 @@ producing per-batch and aggregate Evaluation Metric values plus elapsed-time fig
 MLflow.
 _Avoid_: experiment (too broad — see Experiment above), test
 
+### App
+
+**User**:
+A person with a Supabase Auth account. Signs in with Supabase directly; the API identifies them
+by verifying their Supabase access token. Owns their Photos, and only they can read them.
+_Avoid_: account (fine for the auth record itself, as in "delete my account"), customer
+
+**Photo**:
+One upload by a User and everything derived from it: the Original, the Enhanced Image once its
+Enhancement Job succeeds, and its row in the `photos` table (which carries its Photo Status).
+Clients can only read their own Photos; every write goes through the backend.
+_Avoid_: image (a Photo has two images), upload (that's the act, not the thing)
+
+**Original**:
+The image file a User uploaded, stored unmodified in the `images` bucket — the app's Degraded
+Image. Always owner-only, even if Photos become shareable later, because it may carry GPS/EXIF
+data.
+_Avoid_: raw image, input image
+
+**Enhancement Job**:
+The queued unit of work (arq over Redis) that turns one Photo's Original into its Enhanced Image
+(stored in the `processedimages` bucket). Enqueued by the upload endpoint, run by the worker,
+which loads the Enhancement Model once and acts with the service-role key because a job can
+outlive the User's access token.
+_Avoid_: task, request (the upload request returns before the job runs)
+
+**Photo Status**:
+Where a Photo is in its Enhancement Job's lifecycle: `pending` (stored and queued) →
+`processing` (picked up by the worker) → `completed` (Enhanced Image stored) or `failed`.
+Clients watch it change via Supabase Realtime.
+_Avoid_: state, progress
+
 ## Out of scope
 
-The FastAPI endpoint (`divevision/src/app/main.py`) and the mobile/web app it is meant to
-eventually serve are early-stage and not modeled here. Today the endpoint is a single hard-coded
-call to the U-Shape Enhancement Model with no client, no user or account concept, and no
-persistence — there isn't yet a domain to name beyond the terms above. Revisit this file when
-that strand grows real vocabulary (uploads, accounts, storage, etc.).
+- Choosing among Enhancement Models in the app: it serves U-Shape only.
+- Social features (sharing Photos publicly, geolocation). If added, only Enhanced Images would be
+  shareable, never Originals.

@@ -1,258 +1,316 @@
 import io
 
-import numpy as np
+import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
+from redis.exceptions import ConnectionError as RedisConnectionError
 
-from divevision.src.app import supabase_api
+from divevision.src.app import main, supabase_api
 from divevision.src.app.main import app
 
 client = TestClient(app)
 
-AUTH_HEADERS = {"Authorization": "Bearer access", "X-Refresh-Token": "refresh"}
+AUTH_HEADERS = {"Authorization": "Bearer access"}
+USER_ID = "11111111-1111-1111-1111-111111111111"
+PHOTO_ID = "22222222-2222-2222-2222-222222222222"
 
 
-def test_read_main():
-    response = client.get("/")
-    assert response.status_code == 200
+class FakeQueue:
+    def __init__(self, error: Exception | None = None):
+        self.jobs = []
+        self.error = error
+
+    async def enqueue_job(self, function, *args, _job_id=None):
+        if self.error is not None:
+            raise self.error
+        self.jobs.append((function, args, _job_id))
 
 
-def test_signup(monkeypatch):
-    monkeypatch.setattr(supabase_api, "create_user", lambda mail, password: True)
-    response = client.post(
-        "/signup/", json={"email": "test@example.com", "password": "123456"}
-    )
-    assert response.status_code == 201
+@pytest.fixture
+def queue():
+    fake = FakeQueue()
+    app.dependency_overrides[main.get_queue] = lambda: fake
+    yield fake
+    app.dependency_overrides.pop(main.get_queue, None)
 
 
-def test_signup_failure(monkeypatch):
-    monkeypatch.setattr(supabase_api, "create_user", lambda mail, password: False)
-    response = client.post(
-        "/signup/", json={"email": "test@example.com", "password": "123456"}
-    )
-    assert response.status_code == 400
-
-
-def test_login(monkeypatch):
+@pytest.fixture
+def signed_in(monkeypatch):
+    """Accept the `access` token as USER_ID's, reject anything else."""
     monkeypatch.setattr(
         supabase_api,
-        "sign_in_user",
-        lambda mail, password: {
-            "access_token": "access",
-            "refresh_token": "refresh",
-            "user_id": "user-123",
-        },
+        "get_user_id",
+        lambda token: USER_ID if token == "access" else None,
     )
-    response = client.post(
-        "/login/", json={"email": "test@example.com", "password": "123456"}
-    )
-    assert response.status_code == 200
-    assert response.json() == {
-        "access_token": "access",
-        "refresh_token": "refresh",
-        "user_id": "user-123",
-    }
 
 
-def test_login_invalid_credentials(monkeypatch):
-    monkeypatch.setattr(supabase_api, "sign_in_user", lambda mail, password: None)
-    response = client.post(
-        "/login/", json={"email": "test@example.com", "password": "wrong"}
-    )
-    assert response.status_code == 401
-
-
-def test_upload_image_requires_auth_headers():
-    random_image = Image.fromarray(np.zeros((128, 128, 3), dtype=np.uint8), mode="RGB")
-    buffer = io.BytesIO()
-    random_image.save(buffer, "PNG")
-    response = client.post(
-        "/image/",
-        files={"file": ("foo.png", buffer.getvalue(), "image/png")},
-    )
-    assert response.status_code == 422
-
-
-def test_upload_image_persists_original_and_processed(monkeypatch):
-    random_image = Image.fromarray(np.zeros((128, 128, 3), dtype=np.uint8), mode="RGB")
-    buffer = io.BytesIO()
-    random_image.save(buffer, "PNG")
-
-    uploads = []
+@pytest.fixture
+def storage(monkeypatch):
+    """Record storage/row writes; every call succeeds unless overridden."""
+    calls = {"uploads": [], "deleted_images": [], "created": [], "deleted_rows": []}
     monkeypatch.setattr(
         supabase_api,
         "upload_image",
-        lambda access_token, refresh_token, file, bucket, path=None: uploads.append(
-            (bucket, path)
-        )
-        or (path or f"user-123/{bucket}.jpg"),
-    )
-    monkeypatch.setattr(
-        supabase_api,
-        "create_photo",
-        lambda access_token, refresh_token, original_path, model_name: "photo-1",
-    )
-    completed = []
-    monkeypatch.setattr(
-        supabase_api,
-        "mark_photo_completed",
-        lambda access_token, refresh_token, photo_id, processed_path: completed.append(
-            (photo_id, processed_path)
+        lambda file, bucket, path, content_type, upsert=False: calls["uploads"].append(
+            (bucket, path, content_type)
         )
         or True,
     )
-
-    response = client.post(
-        "/image/",
-        files={"file": ("foo.png", buffer.getvalue(), "image/png")},
-        headers=AUTH_HEADERS,
-    )
-
-    assert response.status_code == 200
-    assert response.headers["content-type"] == "image/png"
-    # Original uploaded first (no explicit path), processed reuses that path.
-    assert uploads[0] == (supabase_api.IMAGES_BUCKET, None)
-    original_path = f"user-123/{supabase_api.IMAGES_BUCKET}.jpg"
-    assert uploads[1] == (supabase_api.PROCESSED_IMAGES_BUCKET, original_path)
-    assert completed == [("photo-1", original_path)]
-
-
-def test_upload_image_marks_failed_when_processed_upload_fails(monkeypatch):
-    random_image = Image.fromarray(np.zeros((128, 128, 3), dtype=np.uint8), mode="RGB")
-    buffer = io.BytesIO()
-    random_image.save(buffer, "PNG")
-
-    # This test only cares about the failure-path branching, not real model
-    # output, so skip the (slow, CPU-only) real inference. `.load()` forces a
-    # full decode while the source file is still open, same as the real
-    # model's preprocessing step.
-    def fake_predict(self, image):
-        image.load()
-        return [image]
-
-    fake_model = type("FakeModel", (), {"name": "U-Shape", "predict": fake_predict})()
-    monkeypatch.setattr(
-        "divevision.src.app.main.UShapeModelWrapper", lambda: fake_model
-    )
-
-    def fake_upload(access_token, refresh_token, file, bucket, path=None):
-        if bucket == supabase_api.IMAGES_BUCKET:
-            return "user-123/original.jpg"
-        return None
-
-    monkeypatch.setattr(supabase_api, "upload_image", fake_upload)
     monkeypatch.setattr(
         supabase_api,
-        "create_photo",
-        lambda access_token, refresh_token, original_path, model_name: "photo-1",
-    )
-    failed = []
-    monkeypatch.setattr(
-        supabase_api,
-        "mark_photo_failed",
-        lambda access_token, refresh_token, photo_id: failed.append(photo_id) or True,
-    )
-
-    response = client.post(
-        "/image/",
-        files={"file": ("foo.png", buffer.getvalue(), "image/png")},
-        headers=AUTH_HEADERS,
-    )
-
-    assert response.status_code == 502
-    assert failed == ["photo-1"]
-
-
-def test_upload_image_deletes_original_when_create_photo_fails(monkeypatch):
-    random_image = Image.fromarray(np.zeros((128, 128, 3), dtype=np.uint8), mode="RGB")
-    buffer = io.BytesIO()
-    random_image.save(buffer, "PNG")
-
-    def fake_predict(self, image):
-        image.load()
-        return [image]
-
-    fake_model = type("FakeModel", (), {"name": "U-Shape", "predict": fake_predict})()
-    monkeypatch.setattr(
-        "divevision.src.app.main.UShapeModelWrapper", lambda: fake_model
-    )
-
-    monkeypatch.setattr(
-        supabase_api,
-        "upload_image",
-        lambda access_token, refresh_token, file, bucket, path=None: "user-123/original.jpg",
+        "delete_images",
+        lambda bucket, paths: calls["deleted_images"].append((bucket, paths)) or True,
     )
     monkeypatch.setattr(
         supabase_api,
         "create_photo",
-        lambda access_token, refresh_token, original_path, model_name: None,
+        lambda photo_id, user_id, original_path, model_name: calls["created"].append(
+            (photo_id, user_id, original_path, model_name)
+        )
+        or True,
     )
-    deleted = []
     monkeypatch.setattr(
         supabase_api,
-        "delete_image",
-        lambda access_token, refresh_token, path, bucket: deleted.append(
-            (path, bucket)
-        ),
+        "delete_photo_row",
+        lambda photo_id: calls["deleted_rows"].append(photo_id) or True,
+    )
+    return calls
+
+
+def _image_bytes(image_format="PNG"):
+    buffer = io.BytesIO()
+    Image.new("RGB", (16, 16)).save(buffer, image_format)
+    return buffer.getvalue()
+
+
+def _upload(content, filename="foo.png", content_type="image/png", headers=None):
+    return client.post(
+        "/photos/",
+        files={"file": (filename, content, content_type)},
+        headers=AUTH_HEADERS if headers is None else headers,
     )
 
-    response = client.post(
-        "/image/",
-        files={"file": ("foo.png", buffer.getvalue(), "image/png")},
-        headers=AUTH_HEADERS,
-    )
 
+# -- auth ------------------------------------------------------------------------
+
+
+def test_removed_endpoints_are_gone():
+    assert client.post("/signup/", json={}).status_code == 404
+    assert client.post("/login/", json={}).status_code == 404
+    assert client.post("/image/").status_code == 404
+
+
+def test_upload_requires_bearer_token(signed_in, queue, storage):
+    response = _upload(_image_bytes(), headers={})
+    assert response.status_code == 401
+    assert response.headers["www-authenticate"] == "Bearer"
+    assert storage["uploads"] == []
+
+
+def test_upload_rejects_invalid_token(signed_in, queue, storage):
+    response = _upload(_image_bytes(), headers={"Authorization": "Bearer forged"})
+    assert response.status_code == 401
+    assert storage["uploads"] == []
+
+
+# -- POST /photos/ -----------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "image_format, content_type, extension",
+    [("PNG", "image/png", "png"), ("JPEG", "image/jpeg", "jpg")],
+)
+def test_upload_stores_original_records_pending_and_enqueues(
+    signed_in, queue, storage, image_format, content_type, extension
+):
+    response = _upload(_image_bytes(image_format))
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["status"] == "pending"
+    photo_id = body["id"]
+
+    original_path = f"{USER_ID}/{photo_id}.{extension}"
+    assert storage["uploads"] == [
+        (supabase_api.IMAGES_BUCKET, original_path, content_type)
+    ]
+    assert storage["created"] == [(photo_id, USER_ID, original_path, "U-Shape")]
+    assert queue.jobs == [("enhance_photo", (photo_id,), photo_id)]
+
+
+def test_upload_rejects_non_image(signed_in, queue, storage):
+    response = _upload(b"not an image", filename="foo.txt", content_type="text/plain")
+    assert response.status_code == 400
+    assert storage["uploads"] == []
+    assert queue.jobs == []
+
+
+def test_upload_rejects_decompression_bomb(signed_in, queue, storage, monkeypatch):
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 100)
+    response = _upload(_image_bytes())
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Invalid image file"
+    assert storage["uploads"] == []
+    assert queue.jobs == []
+
+
+def test_upload_rejects_unsupported_format(signed_in, queue, storage):
+    response = _upload(
+        _image_bytes("GIF"), filename="foo.gif", content_type="image/gif"
+    )
+    assert response.status_code == 400
+    assert storage["uploads"] == []
+
+
+def test_upload_rejects_too_large(signed_in, queue, storage, monkeypatch):
+    monkeypatch.setattr(main, "MAX_UPLOAD_BYTES", 10)
+    response = _upload(_image_bytes())
+    assert response.status_code == 413
+    assert storage["uploads"] == []
+
+
+def test_upload_fails_when_original_cannot_be_stored(
+    signed_in, queue, storage, monkeypatch
+):
+    monkeypatch.setattr(supabase_api, "upload_image", lambda *a, **kw: False)
+    response = _upload(_image_bytes())
     assert response.status_code == 502
-    assert deleted == [("user-123/original.jpg", supabase_api.IMAGES_BUCKET)]
+    assert storage["created"] == []
+    assert queue.jobs == []
 
 
-def test_delete_photo(monkeypatch):
+def test_upload_removes_original_when_row_cannot_be_recorded(
+    signed_in, queue, storage, monkeypatch
+):
+    monkeypatch.setattr(supabase_api, "create_photo", lambda *a: False)
+    response = _upload(_image_bytes())
+    assert response.status_code == 502
+    [(bucket, [path])] = storage["deleted_images"]
+    assert bucket == supabase_api.IMAGES_BUCKET
+    assert path.startswith(f"{USER_ID}/")
+    assert queue.jobs == []
+
+
+def test_upload_rolls_back_when_queue_rejects_job(signed_in, storage):
+    failing_queue = FakeQueue(error=RedisConnectionError("redis down"))
+    app.dependency_overrides[main.get_queue] = lambda: failing_queue
+    try:
+        response = _upload(_image_bytes())
+    finally:
+        app.dependency_overrides.pop(main.get_queue, None)
+
+    assert response.status_code == 503
+    [(photo_id, _, original_path, _)] = storage["created"]
+    assert storage["deleted_rows"] == [photo_id]
+    assert storage["deleted_images"] == [(supabase_api.IMAGES_BUCKET, [original_path])]
+
+
+def test_upload_returns_503_when_queue_unreachable(signed_in, storage, monkeypatch):
+    async def unreachable(settings):
+        raise RedisConnectionError("redis down")
+
+    monkeypatch.setattr(main, "create_pool", unreachable)
+    monkeypatch.setattr(app.state, "queue", None, raising=False)
+
+    response = _upload(_image_bytes())
+
+    assert response.status_code == 503
+    assert storage["uploads"] == []
+
+
+# -- DELETE /photos/{id}/ and /account/ -----------------------------------------------
+
+
+def test_delete_photo(signed_in, monkeypatch):
+    calls = []
     monkeypatch.setattr(
         supabase_api,
         "delete_photo",
-        lambda access_token, refresh_token, photo_id: photo_id == "photo-1",
+        lambda photo_id, user_id: calls.append((photo_id, user_id)) or True,
     )
-    response = client.delete("/photos/photo-1/", headers=AUTH_HEADERS)
+    response = client.delete(f"/photos/{PHOTO_ID}/", headers=AUTH_HEADERS)
     assert response.status_code == 204
+    assert calls == [(PHOTO_ID, USER_ID)]
 
 
-def test_delete_photo_not_found(monkeypatch):
-    monkeypatch.setattr(
-        supabase_api,
-        "delete_photo",
-        lambda access_token, refresh_token, photo_id: False,
-    )
-    response = client.delete("/photos/photo-1/", headers=AUTH_HEADERS)
+def test_delete_photo_not_found(signed_in, monkeypatch):
+    monkeypatch.setattr(supabase_api, "delete_photo", lambda photo_id, user_id: False)
+    response = client.delete(f"/photos/{PHOTO_ID}/", headers=AUTH_HEADERS)
     assert response.status_code == 404
 
 
-def test_delete_account(monkeypatch):
+def test_delete_photo_rejects_malformed_id(signed_in):
+    response = client.delete("/photos/not-a-uuid/", headers=AUTH_HEADERS)
+    assert response.status_code == 422
+
+
+def test_delete_photo_requires_auth(signed_in):
+    response = client.delete(f"/photos/{PHOTO_ID}/")
+    assert response.status_code == 401
+
+
+def test_delete_account(signed_in, monkeypatch):
+    calls = []
     monkeypatch.setattr(
-        supabase_api, "delete_account", lambda access_token, refresh_token: True
+        supabase_api, "delete_account", lambda user_id: calls.append(user_id) or True
     )
     response = client.delete("/account/", headers=AUTH_HEADERS)
     assert response.status_code == 204
+    assert calls == [USER_ID]
 
 
-def test_delete_account_failure(monkeypatch):
-    monkeypatch.setattr(
-        supabase_api, "delete_account", lambda access_token, refresh_token: False
-    )
+def test_delete_account_failure(signed_in, monkeypatch):
+    monkeypatch.setattr(supabase_api, "delete_account", lambda user_id: False)
     response = client.delete("/account/", headers=AUTH_HEADERS)
     assert response.status_code == 400
+
+
+def test_delete_account_requires_auth(signed_in):
+    response = client.delete("/account/", headers={"Authorization": "Bearer forged"})
+    assert response.status_code == 401
+
+
+# -- CORS ----------------------------------------------------------------------------
+
+
+def test_cors_allows_configured_expo_origin():
+    origin = main.CORS_ALLOWED_ORIGINS[0]
+    response = client.options(
+        "/photos/",
+        headers={
+            "Origin": origin,
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "authorization",
+        },
+    )
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == origin
+
+
+def test_cors_rejects_unknown_origin():
+    response = client.options(
+        "/photos/",
+        headers={
+            "Origin": "https://evil.example.com",
+            "Access-Control-Request-Method": "POST",
+        },
+    )
+    assert "access-control-allow-origin" not in response.headers
+
+
+# -- POST /leaderboard/ (unchanged) ----------------------------------------------------
+
+LEADERBOARD_ENTRY = {
+    "model_name": "U-Shape",
+    "dataset_name": "UIEB",
+    "metric_name": "ssim",
+    "score": 0.9,
+}
 
 
 def test_leaderboard_rejects_missing_secret(monkeypatch):
     monkeypatch.setenv("LEADERBOARD_SHARED_SECRET", "top-secret")
-    response = client.post(
-        "/leaderboard/",
-        json={
-            "model_name": "U-Shape",
-            "dataset_name": "UIEB",
-            "metric_name": "ssim",
-            "score": 0.9,
-        },
-    )
+    response = client.post("/leaderboard/", json=LEADERBOARD_ENTRY)
     assert response.status_code == 422  # missing required header
 
 
@@ -260,12 +318,7 @@ def test_leaderboard_rejects_wrong_secret(monkeypatch):
     monkeypatch.setenv("LEADERBOARD_SHARED_SECRET", "top-secret")
     response = client.post(
         "/leaderboard/",
-        json={
-            "model_name": "U-Shape",
-            "dataset_name": "UIEB",
-            "metric_name": "ssim",
-            "score": 0.9,
-        },
+        json=LEADERBOARD_ENTRY,
         headers={"X-Leaderboard-Secret": "wrong"},
     )
     assert response.status_code == 401
@@ -275,12 +328,7 @@ def test_leaderboard_rejects_when_secret_not_configured(monkeypatch):
     monkeypatch.delenv("LEADERBOARD_SHARED_SECRET", raising=False)
     response = client.post(
         "/leaderboard/",
-        json={
-            "model_name": "U-Shape",
-            "dataset_name": "UIEB",
-            "metric_name": "ssim",
-            "score": 0.9,
-        },
+        json=LEADERBOARD_ENTRY,
         headers={"X-Leaderboard-Secret": ""},
     )
     assert response.status_code == 401
@@ -300,12 +348,7 @@ def test_leaderboard_accepts_correct_secret(monkeypatch):
 
     response = client.post(
         "/leaderboard/",
-        json={
-            "model_name": "U-Shape",
-            "dataset_name": "UIEB",
-            "metric_name": "ssim",
-            "score": 0.9,
-        },
+        json=LEADERBOARD_ENTRY,
         headers={"X-Leaderboard-Secret": "top-secret"},
     )
 

@@ -7,13 +7,54 @@ services:
       - "8000:8000"
     environment:
       - PYTHONPATH=/app
+      - REDIS_URL=redis://redis:6379
     env_file:
       - .env
     volumes:
       - ./divevision:/app/divevision
     restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
     networks:
       - frontend-network
+      - queue-network
+
+  # Runs Enhancement Jobs queued by the api (arq over Redis): loads the U-Shape
+  # model once, enhances each photo, and records the outcome in Supabase with
+  # the service-role key. Same image as the api; scale with `--scale worker=N`.
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    command: ["arq", "divevision.src.app.worker.WorkerSettings"]
+    environment:
+      - PYTHONPATH=/app
+      - REDIS_URL=redis://redis:6379
+    env_file:
+      - .env
+    volumes:
+      - ./divevision:/app/divevision
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - queue-network
+      # Egress to the Supabase project
+      - frontend-network
+
+  # Job queue between the api and the worker; only reachable on queue-network.
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - queue-network
 
   mlflow:
     build:
@@ -96,6 +137,9 @@ networks:
     internal: false # Allows for communication with other services
   frontend-network:
     driver: bridge
+  queue-network:
+    driver: bridge
+    internal: true
 
 volumes:
   postgres_dev_data:
