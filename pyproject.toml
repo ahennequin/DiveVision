@@ -25,6 +25,7 @@ albumentations = "^2.0.5"
 gdown = "^5.2.0"
 supabase = "^2.11.0"
 pillow = "11.0.0"
+arq = "^0.26.3"
 
 
 [tool.poetry.group.dev.dependencies]
@@ -43,6 +44,11 @@ psycopg2-binary = "^2.9.12"
 
 [tool.mypy]
 ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: needs a local Supabase stack; skipped unless SUPABASE_TEST_* is set",
+]
 
 [build-system]
 requires = ["poetry-core"]

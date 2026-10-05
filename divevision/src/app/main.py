@@ -2,30 +2,57 @@ import io
 import logging
 import os
 import secrets
-from typing import Annotated
+import uuid
+from contextlib import asynccontextmanager
+from typing import Annotated, Literal
 
+from arq import ArqRedis, create_pool
+from arq.connections import RedisSettings
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Response, UploadFile
-from fastapi.responses import HTMLResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, ConfigDict
+from redis.exceptions import RedisError
 
 from divevision.src.app import supabase_api
-from divevision.src.models.u_shape_model import UShapeModelWrapper
-
-app = FastAPI()
+from divevision.src.app.enhancement import MODEL_NAME
 
 logger = logging.getLogger(__name__)
 
+REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
+# Comma-separated origins allowed to call the API from a browser (the Expo
+# web client); 8081 is the Expo dev server's default port.
+_cors_origins = os.environ.get("CORS_ALLOWED_ORIGINS", "http://localhost:8081")
+CORS_ALLOWED_ORIGINS = [o.strip() for o in _cors_origins.split(",") if o.strip()]
 
-class Credentials(BaseModel):
-    email: str
-    password: str
+# Same cap as the storage buckets' `file_size_limit` (supabase/migrations/).
+MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+# Formats the buckets accept (`allowed_mime_types`), keyed by PIL format.
+ACCEPTED_FORMATS = {"JPEG": ("image/jpeg", "jpg"), "PNG": ("image/png", "png")}
 
 
-class AuthSession(BaseModel):
-    access_token: str
-    refresh_token: str
-    user_id: str
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+    queue: ArqRedis | None = getattr(app.state, "queue", None)
+    if queue is not None:
+        await queue.aclose()
+
+
+app = FastAPI(lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ALLOWED_ORIGINS,
+    allow_methods=["POST", "DELETE"],
+    allow_headers=["Authorization", "Content-Type"],
+)
+
+
+class PhotoCreated(BaseModel):
+    id: uuid.UUID
+    status: Literal["pending"]
 
 
 class LeaderboardEntry(BaseModel):
@@ -37,145 +64,108 @@ class LeaderboardEntry(BaseModel):
     score: float
 
 
-@app.get(
-    "/",
-    response_class=HTMLResponse,
-)
-async def root():
-    return """
-<body>
-<form action="/image/" enctype="multipart/form-data" method="post">
-<input name="file" type="file">
-<input type="submit">
-</form>
-</body>
-"""
+bearer_scheme = HTTPBearer(auto_error=False)
 
 
-@app.post("/signup/", status_code=201)
-async def signup(credentials: Credentials):
-    if not supabase_api.create_user(credentials.email, credentials.password):
-        raise HTTPException(status_code=400, detail="Could not create user")
-    return {"detail": "user created"}
-
-
-@app.post("/login/", response_model=AuthSession)
-async def login(credentials: Credentials):
-    session = supabase_api.sign_in_user(credentials.email, credentials.password)
-    if session is None:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-    return session
-
-
-def auth_tokens(
-    authorization: Annotated[str, Header()],
-    x_refresh_token: Annotated[str, Header()],
-) -> tuple[str, str]:
-    """Extract the Supabase session tokens returned by /login/ from request headers."""
-    if not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing bearer token")
-    return authorization.removeprefix("Bearer "), x_refresh_token
-
-
-@app.post(
-    "/image/",
-    responses={200: {"content": {"image/png": {}}}},
-    response_class=Response,
-)
-async def upload_file(
-    file: UploadFile = File(...),
-    tokens: tuple[str, str] = Depends(auth_tokens),
-):
-    """Run the default model on an uploaded photo and persist both copies.
-
-    Keeps the original synchronous request/response shape (upload in,
-    processed PNG bytes out) - the only change is that the original and
-    processed images are now saved to storage and tracked in the `photos`
-    table instead of being discarded after the response is sent.
-    """
-    if not file.content_type or not file.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="File is not an image")
-
-    access_token, refresh_token = tokens
-
-    contents = await file.read()
-    file_buffer = io.BytesIO(contents)
-    try:
-        image = Image.open(file_buffer)
-        image.verify()  # Verify the image
-    except UnidentifiedImageError:
-        raise HTTPException(status_code=400, detail="Invalid image file")
-    except Exception:
-        logger.exception("Error processing uploaded image")
-        raise HTTPException(status_code=500, detail="Error processing image")
-    else:
-        # verify() leaves the image unusable for further processing, so reopen it
-        file_buffer.seek(0)
-        image = Image.open(file_buffer)
-
-        model = UShapeModelWrapper()
-        output: Image.Image = model.predict(image)[0]  # predict() returns a list
-
-    buffer = io.BytesIO()
-    output.save(buffer, "PNG")
-    processed_bytes = buffer.getvalue()
-
-    original_path = supabase_api.upload_image(
-        access_token, refresh_token, contents, supabase_api.IMAGES_BUCKET
-    )
-    if original_path is None:
+def current_user_id(
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer_scheme)],
+) -> str:
+    """Verify the caller's Supabase access token (`Authorization: Bearer`)."""
+    user_id = supabase_api.get_user_id(credentials.credentials) if credentials else None
+    if user_id is None:
         raise HTTPException(
-            status_code=502, detail="Could not store the original photo"
+            status_code=401,
+            detail="Invalid or missing access token",
+            headers={"WWW-Authenticate": "Bearer"},
         )
+    return user_id
 
-    photo_id = supabase_api.create_photo(
-        access_token, refresh_token, original_path, model.name
-    )
-    if photo_id is None:
-        supabase_api.delete_image(
-            access_token, refresh_token, original_path, supabase_api.IMAGES_BUCKET
-        )
+
+async def get_queue() -> ArqRedis:
+    """The arq Redis pool, created on first use and closed on shutdown."""
+    queue: ArqRedis | None = getattr(app.state, "queue", None)
+    if queue is None:
+        try:
+            queue = await create_pool(RedisSettings.from_dsn(REDIS_URL))
+        except (RedisError, OSError):
+            logger.exception("Could not connect to the job queue")
+            raise HTTPException(status_code=503, detail="Enhancement queue unavailable")
+        app.state.queue = queue
+    return queue
+
+
+def _sniff_image(contents: bytes) -> tuple[str, str]:
+    """Return (content type, extension) of an accepted image, else raise 400."""
+    try:
+        with Image.open(io.BytesIO(contents)) as image:
+            image_format = image.format
+            image.verify()
+    except (UnidentifiedImageError, OSError, SyntaxError, ValueError):
+        raise HTTPException(status_code=400, detail="Invalid image file")
+
+    if image_format not in ACCEPTED_FORMATS:
+        raise HTTPException(status_code=400, detail="Only JPEG and PNG are supported")
+    return ACCEPTED_FORMATS[image_format]
+
+
+@app.post("/photos/", status_code=202, response_model=PhotoCreated)
+async def upload_photo(
+    user_id: Annotated[str, Depends(current_user_id)],
+    queue: Annotated[ArqRedis, Depends(get_queue)],
+    file: UploadFile = File(...),
+):
+    """Store the original photo, record it as `pending`, and queue its enhancement.
+
+    Returns immediately; the worker later sets the row's status to
+    `completed` (with `processed_path`) or `failed`. Clients follow progress
+    by reading their `photos` row from Supabase (or via Realtime).
+    """
+    contents = await file.read(MAX_UPLOAD_BYTES + 1)
+    if len(contents) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="Image is too large")
+    content_type, extension = _sniff_image(contents)
+
+    photo_id = str(uuid.uuid4())
+    original_path = f"{user_id}/{photo_id}.{extension}"
+
+    if not supabase_api.upload_image(
+        contents, supabase_api.IMAGES_BUCKET, original_path, content_type
+    ):
+        raise HTTPException(status_code=502, detail="Could not store the photo")
+
+    if not supabase_api.create_photo(photo_id, user_id, original_path, MODEL_NAME):
+        supabase_api.delete_images(supabase_api.IMAGES_BUCKET, [original_path])
         raise HTTPException(status_code=502, detail="Could not record the photo")
 
-    # Store the processed result under the same relative path as the original.
-    processed_path = supabase_api.upload_image(
-        access_token,
-        refresh_token,
-        processed_bytes,
-        supabase_api.PROCESSED_IMAGES_BUCKET,
-        path=original_path,
-    )
-    if processed_path is None:
-        supabase_api.mark_photo_failed(access_token, refresh_token, photo_id)
-        raise HTTPException(
-            status_code=502, detail="Could not store the processed photo"
-        )
+    try:
+        # The photo id doubles as the job id, so a job is never queued twice.
+        await queue.enqueue_job("enhance_photo", photo_id, _job_id=photo_id)
+    except (RedisError, OSError):
+        logger.exception("Could not enqueue enhancement for photo %s", photo_id)
+        supabase_api.delete_photo_row(photo_id)
+        supabase_api.delete_images(supabase_api.IMAGES_BUCKET, [original_path])
+        raise HTTPException(status_code=503, detail="Enhancement queue unavailable")
 
-    supabase_api.mark_photo_completed(
-        access_token, refresh_token, photo_id, processed_path
-    )
-
-    return Response(content=processed_bytes, media_type="image/png")
+    return PhotoCreated(id=uuid.UUID(photo_id), status="pending")
 
 
 @app.delete("/photos/{photo_id}/", status_code=204)
 async def delete_photo(
-    photo_id: str,
-    tokens: tuple[str, str] = Depends(auth_tokens),
+    photo_id: uuid.UUID,
+    user_id: Annotated[str, Depends(current_user_id)],
 ):
-    access_token, refresh_token = tokens
-    if not supabase_api.delete_photo(access_token, refresh_token, photo_id):
+    """Delete one of the caller's photos (both images and its row)."""
+    if not supabase_api.delete_photo(str(photo_id), user_id):
         raise HTTPException(status_code=404, detail="Photo not found")
     return Response(status_code=204)
 
 
 @app.delete("/account/", status_code=204)
 async def delete_account(
-    tokens: tuple[str, str] = Depends(auth_tokens),
+    user_id: Annotated[str, Depends(current_user_id)],
 ):
-    """Erase a user's account: every photo (storage + row), then the auth user itself."""
-    access_token, refresh_token = tokens
-    if not supabase_api.delete_account(access_token, refresh_token):
+    """Erase the caller's account: every photo (storage + row), then the auth user."""
+    if not supabase_api.delete_account(user_id):
         raise HTTPException(status_code=400, detail="Could not delete account")
     return Response(status_code=204)
 

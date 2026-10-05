@@ -1,0 +1,103 @@
+"""arq worker that runs Enhancement Jobs queued by `POST /photos/`.
+
+Run with `arq divevision.src.app.worker.WorkerSettings` (the `worker`
+service in docker-compose.yml). The model is loaded once per worker process
+on startup. Jobs use the Supabase service-role key, because a job can
+outlive the access token of the user who uploaded the photo.
+"""
+
+import asyncio
+import logging
+import os
+
+from arq.connections import RedisSettings
+
+from divevision.src.app import supabase_api
+from divevision.src.app.enhancement import (
+    ENHANCED_CONTENT_TYPE,
+    enhance_image,
+    load_model,
+)
+
+logger = logging.getLogger(__name__)
+
+REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
+
+
+def processed_path_for(original_path: str) -> str:
+    """`<user_id>/<photo_id>.<ext>` -> `<user_id>/<photo_id>.png`."""
+    return original_path.rsplit(".", 1)[0] + ".png"
+
+
+def process_photo(model, photo_id: str) -> str:
+    """Enhance one photo and record the outcome on its `photos` row.
+
+    Returns the final status ("completed", "failed", or "skipped" when the
+    row no longer exists or was already finished). Never raises for a bad
+    photo: any failure is recorded as `failed` instead of retried.
+    """
+    photo = supabase_api.get_photo(photo_id)
+    if photo is None:
+        logger.info("Photo %s was deleted before it was processed", photo_id)
+        return "skipped"
+    if photo["status"] in ("completed", "failed"):
+        return "skipped"
+
+    supabase_api.mark_photo_processing(photo_id)
+
+    try:
+        original = supabase_api.download_image(
+            supabase_api.IMAGES_BUCKET, photo["original_path"]
+        )
+        if original is None:
+            raise RuntimeError("could not download the original photo")
+
+        enhanced = enhance_image(model, original)
+
+        processed_path = processed_path_for(photo["original_path"])
+        if not supabase_api.upload_image(
+            enhanced,
+            supabase_api.PROCESSED_IMAGES_BUCKET,
+            processed_path,
+            ENHANCED_CONTENT_TYPE,
+            upsert=True,  # a retried job overwrites its own earlier output
+        ):
+            raise RuntimeError("could not store the enhanced photo")
+    except Exception:
+        logger.exception("Enhancement failed for photo %s", photo_id)
+        supabase_api.mark_photo_failed(photo_id)
+        return "failed"
+
+    if supabase_api.mark_photo_completed(photo_id, processed_path):
+        return "completed"
+
+    # The row vanished mid-job (photo or account deleted): don't leave an
+    # orphaned enhanced image behind. If it still exists, the update itself
+    # failed, so surface that as `failed` rather than leave it `processing`.
+    if supabase_api.get_photo(photo_id) is None:
+        supabase_api.delete_images(
+            supabase_api.PROCESSED_IMAGES_BUCKET, [processed_path]
+        )
+        return "skipped"
+    supabase_api.mark_photo_failed(photo_id)
+    return "failed"
+
+
+async def enhance_photo(ctx: dict, photo_id: str) -> str:
+    """arq job: enhance the photo `photo_id` (job id is the photo id too)."""
+    # Inference and supabase-py calls are blocking; keep them off the event loop
+    # so arq can still heartbeat and enforce `job_timeout`.
+    return await asyncio.to_thread(process_photo, ctx["model"], photo_id)
+
+
+async def startup(ctx: dict) -> None:
+    ctx["model"] = load_model()
+
+
+class WorkerSettings:
+    functions = [enhance_photo]
+    on_startup = startup
+    redis_settings = RedisSettings.from_dsn(REDIS_URL)
+    # One CPU-bound inference at a time per process; scale by adding workers.
+    max_jobs = 1
+    job_timeout = 300

@@ -7,9 +7,9 @@ DiveVision has two current strands of work — see `README.md` for the full pict
 
 1. **Experiment workflow**: testing/comparing underwater image enhancement models (U-Shape
    Transformer, CE-VAE), benchmarked via MLflow on the LSUI/UIEB datasets.
-2. **Mobile app serving the tested models**: early stage. Only a minimal FastAPI endpoint exists
-   today (`divevision/src/app/main.py`); no mobile client, web app, social features, or
-   geolocation exist yet. Don't imply otherwise in docs or code comments.
+2. **App serving the U-Shape model**: backend only so far — FastAPI (`divevision/src/app/main.py`)
+   plus an arq enhancement worker (`divevision/src/app/worker.py`). No Expo/mobile/web client,
+   social features, or geolocation exist yet (client is issue #17). Don't imply otherwise.
 
 ## Repo layout
 
@@ -20,15 +20,19 @@ DiveVision has two current strands of work — see `README.md` for the full pict
 - `divevision/src/metrics/` — SSIM/PSNR metrics used by the benchmark.
 - `divevision/src/test.py` — the MLflow benchmark pipeline (entry point via
   `python -m divevision.src.test`).
-- `divevision/src/app/main.py` — the FastAPI serving endpoint.
-- `divevision/test/` — pytest suite for models and the FastAPI app.
+- `divevision/src/app/` — the app backend: `main.py` (FastAPI), `worker.py` (arq jobs),
+  `enhancement.py` (the one function that runs the model on a photo), `supabase_api.py`.
+- `divevision/test/` — pytest suite for models, the API, and the worker.
 - `divevision/notebooks/test_model.ipynb` — manual smoke test for a model.
 
 ## Running things
 
 - Tests: `poetry run pytest`
 - Benchmark: see "Running the benchmark" in `README.md` (Docker Compose-based).
-- FastAPI server: `poetry run fastapi dev divevision/src/app/main.py`
+- API + worker + Redis: `docker compose up api worker` (or see README's "Running the FastAPI
+  server and worker").
+- RLS integration tests: `divevision/test/test_rls_integration.py` (skipped unless pointed at a
+  local `supabase start` stack; its docstring has the command).
 
 ## Known issues
 
@@ -52,23 +56,27 @@ exposure where MLflow-adjacent policies leaked access to user photos):
   wraps `supabase-py` for it; `divevision/src/app/main.py` exposes it over FastAPI. Validate
   migrations locally with `supabase start` (requires Docker) before trusting them.
 
-`supabase_api.py` creates a fresh client per call (`get_client()`/`get_admin_client()`) rather
-than sharing one module-level client, so signing in as one user can't leak that session into a
-concurrent request for another. Authenticated endpoints in `main.py` expect
-`Authorization: Bearer <access_token>` and `X-Refresh-Token` headers, since `supabase-py`'s
-`auth.set_session` needs both to scope a client to a user's session.
+Clients sign in with Supabase directly and only ever *read* their own `photos` rows, storage
+objects, and Realtime events (owner-only SELECT policies; no client write policies or grants).
+Every write goes through the backend with the service-role key (`get_admin_client()`), which
+bypasses RLS — so any admin-client query made on a user's behalf must filter by the `user_id`
+from the verified token itself (see `get_photo(..., user_id=)`). The API verifies
+`Authorization: Bearer <access token>` via Supabase Auth (`get_user_id`); there is no
+refresh-token header or API sign-in. Rationale: `docs/adr/0002-async-enhancement-and-rls-boundary.md`.
 
 Every per-user table/bucket is RLS-scoped to `auth.uid()` - never add a blanket
 `USING(true)`/`WITH CHECK(true)` policy alongside a scoped one; Postgres ORs permissive
-policies together, so the blanket one silently wins and defeats the scoping.
+policies together, so the blanket one silently wins and defeats the scoping. Future public
+sharing must stay additive and never cover the `images` bucket (Originals may carry GPS/EXIF).
 
-`POST /image/` persists the original and processed photo (same relative path in both buckets)
-and a `photos` row as a side effect of the existing synchronous upload-and-return flow - no
-async job queue. `POST /leaderboard/` is a separate, non-user-auth path gated by a shared
-secret (`LEADERBOARD_SHARED_SECRET`, `X-Leaderboard-Secret` header) for a local MLflow
-benchmark script to record scores; it writes via the service-role key, which never leaves the
-backend. `DELETE /account/` relies on `photos.user_id`'s `ON DELETE CASCADE` FK to clean up
-rows once the auth user is deleted - it only needs to explicitly remove storage objects first.
+`main.py` must not import `divevision.src.models` (importing it instantiates and loads the
+model); only the worker loads it, via `enhancement.load_model()`. `POST /photos/` stores the
+Original, inserts a `pending` row, and enqueues `enhance_photo` with the photo id as the arq job
+id; the worker marks the row `processing`, then `completed` or `failed`. `POST /leaderboard/`
+is a separate, non-user-auth path gated by a shared secret (`LEADERBOARD_SHARED_SECRET`,
+`X-Leaderboard-Secret` header) for a local MLflow benchmark script. `DELETE /account/` relies on
+`photos.user_id`'s `ON DELETE CASCADE` FK to clean up rows once the auth user is deleted - it
+only needs to explicitly remove storage objects first.
 
 ## Maintaining this file
 

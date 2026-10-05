@@ -18,22 +18,22 @@ has two current strands of work:
   (`divevision/src/models/abstract_model.py`).
 - **A benchmark pipeline** (`divevision/src/test.py`) that runs each model against the LSUI and
   UIEB datasets, computes SSIM/PSNR metrics, and logs runs to MLflow.
-- **A FastAPI server** (`divevision/src/app/main.py`) backed by Supabase (auth, photo storage,
-  a `photos` table — see `AGENTS.md`). Endpoints: `/signup/` and `/login/`; an authenticated
-  `POST /image/` that runs the U-Shape Transformer on an uploaded image, returns the enhanced
-  PNG, and persists the original/processed photos plus a `photos` row; `DELETE /photos/{id}/`
-  and `DELETE /account/` (full GDPR account erasure); and a shared-secret-gated
-  `POST /leaderboard/` used by the benchmark pipeline to record scores. This is the seed of the
-  "serve a model to a client" mobile-app goal above — it is not yet wired up to any mobile
-  client.
+- **A FastAPI server** (`divevision/src/app/main.py`) and an **arq worker**
+  (`divevision/src/app/worker.py`) backed by Supabase (auth, photo storage, a `photos` table)
+  and Redis. Clients sign in with Supabase directly and read their own photos from it (rows,
+  storage objects, Realtime status updates — owner-only via RLS); the API verifies their
+  Supabase access token and exposes only `POST /photos/` (store the original, queue its
+  U-Shape Transformer enhancement, return the photo id at once), `DELETE /photos/{id}/`,
+  `DELETE /account/` (full GDPR account erasure), and a shared-secret-gated
+  `POST /leaderboard/` used by the benchmark pipeline to record scores. See
+  `docs/adr/0002-async-enhancement-and-rls-boundary.md`. No client consumes it yet.
 - **Tests** for the models and the FastAPI app (`divevision/test/`).
 
 ## Roadmap (not implemented yet)
 
 - Training a model from scratch (the README previously implied this existed — it does not; only
   inference over pretrained checkpoints is implemented).
-- A dedicated web app.
-- A real mobile app client consuming the FastAPI endpoint (or its successor).
+- A single Expo client (web first, then mobile) consuming the API and Supabase (issue #17).
 - Social-network features and photo geolocation — explicitly out of scope until the above lands.
 
 ## Installation
@@ -80,29 +80,43 @@ themselves — they expect the environment to already be populated (as Docker Co
 `env_file` does), so running them directly outside of `docker compose` requires exporting the
 `.env` variables into your shell first.
 
-## Running the FastAPI server
+## Running the FastAPI server and worker
 
 Fill in this app's own Supabase project variables (`SUPABASE_URL`, `SUPABASE_KEY`,
-`SUPABASE_SERVICE_ROLE_KEY`, `LEADERBOARD_SHARED_SECRET`) in `.env` — see `AGENTS.md` for why
-this is a separate project from the MLflow tracking backend's. Validate `supabase/migrations/`
-locally with `supabase start` (requires Docker) before relying on them.
+`SUPABASE_SERVICE_ROLE_KEY`, `LEADERBOARD_SHARED_SECRET`) plus `REDIS_URL` and
+`CORS_ALLOWED_ORIGINS` in `.env` — see `AGENTS.md` for why this is a separate Supabase project
+from the MLflow tracking backend's. Validate `supabase/migrations/` locally with
+`supabase start` (requires Docker) before relying on them.
+
+Via Docker Compose (reads `.env` through `env_file`, no export needed), which starts the API,
+the enhancement worker, and Redis:
+
+```
+docker compose up api worker
+```
+
+Or directly, with a Redis server reachable at `REDIS_URL`:
 
 ```
 poetry run fastapi dev divevision/src/app/main.py
+poetry run arq divevision.src.app.worker.WorkerSettings
 ```
 
-Or via Docker Compose (reads `.env` through `env_file`, no export needed): `docker compose up api`.
-
-This exposes a form at `/` to upload an image, plus `/signup/`, `/login/`, an authenticated
-`POST /image/` that returns the U-Shape Transformer's enhanced PNG output (and persists it —
-see `AGENTS.md`), `DELETE /photos/{id}/`, `DELETE /account/`, and `POST /leaderboard/`. There is
-no mobile client in this repository yet.
+All endpoints except `/leaderboard/` need `Authorization: Bearer <Supabase access token>`.
+`POST /photos/` (multipart `file`, JPEG or PNG) answers `202 {"id": ..., "status": "pending"}`;
+the worker then sets the photo's `photos.status` to `completed` (with `processed_path` in the
+`processedimages` bucket) or `failed`. There is no mobile or web client in this repository yet.
 
 ## Running tests
 
 ```
 poetry run pytest
 ```
+
+The default run is offline. `divevision/test/test_rls_integration.py` proves the owner-only
+access rules (rows, storage, Realtime) against a local Supabase stack and skips unless
+`SUPABASE_TEST_URL`, `SUPABASE_TEST_ANON_KEY` and `SUPABASE_TEST_SERVICE_ROLE_KEY` are set —
+see its docstring for running it after `supabase start`.
 
 ## Resources
 
