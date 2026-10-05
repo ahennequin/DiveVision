@@ -100,7 +100,13 @@ def _sniff_image(contents: bytes) -> tuple[str, str]:
         with Image.open(io.BytesIO(contents)) as image:
             image_format = image.format
             image.verify()
-    except (UnidentifiedImageError, OSError, SyntaxError, ValueError):
+    except (
+        UnidentifiedImageError,
+        Image.DecompressionBombError,
+        OSError,
+        SyntaxError,
+        ValueError,
+    ):
         raise HTTPException(status_code=400, detail="Invalid image file")
 
     if image_format not in ACCEPTED_FORMATS:

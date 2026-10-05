@@ -145,6 +145,15 @@ def test_upload_rejects_non_image(signed_in, queue, storage):
     assert queue.jobs == []
 
 
+def test_upload_rejects_decompression_bomb(signed_in, queue, storage, monkeypatch):
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 100)
+    response = _upload(_image_bytes())
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Invalid image file"
+    assert storage["uploads"] == []
+    assert queue.jobs == []
+
+
 def test_upload_rejects_unsupported_format(signed_in, queue, storage):
     response = _upload(
         _image_bytes("GIF"), filename="foo.gif", content_type="image/gif"

@@ -11,6 +11,7 @@ import logging
 import os
 
 from arq.connections import RedisSettings
+from arq.worker import Retry
 
 from divevision.src.app import supabase_api
 from divevision.src.app.enhancement import (
@@ -22,6 +23,7 @@ from divevision.src.app.enhancement import (
 logger = logging.getLogger(__name__)
 
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
+LOOKUP_RETRY_DELAY = 10
 
 
 def processed_path_for(original_path: str) -> str:
@@ -34,9 +36,14 @@ def process_photo(model, photo_id: str) -> str:
 
     Returns the final status ("completed", "failed", or "skipped" when the
     row no longer exists or was already finished). Never raises for a bad
-    photo: any failure is recorded as `failed` instead of retried.
+    photo: any failure is recorded as `failed` instead of retried. Raises
+    `arq.worker.Retry` if the row cannot be read at all, so the job runs again.
     """
-    photo = supabase_api.get_photo(photo_id)
+    try:
+        photo = supabase_api.find_photo(photo_id)
+    except supabase_api.PhotoLookupError as e:
+        logger.warning("Could not read photo %s; retrying", photo_id)
+        raise Retry(defer=LOOKUP_RETRY_DELAY) from e
     if photo is None:
         logger.info("Photo %s was deleted before it was processed", photo_id)
         return "skipped"
@@ -72,9 +79,14 @@ def process_photo(model, photo_id: str) -> str:
         return "completed"
 
     # The row vanished mid-job (photo or account deleted): don't leave an
-    # orphaned enhanced image behind. If it still exists, the update itself
-    # failed, so surface that as `failed` rather than leave it `processing`.
-    if supabase_api.get_photo(photo_id) is None:
+    # orphaned enhanced image behind. If it still exists (or we can't tell),
+    # the update itself failed, so surface that as `failed` rather than leave
+    # it `processing`.
+    try:
+        row_gone = supabase_api.find_photo(photo_id) is None
+    except supabase_api.PhotoLookupError:
+        row_gone = False
+    if row_gone:
         supabase_api.delete_images(
             supabase_api.PROCESSED_IMAGES_BUCKET, [processed_path]
         )

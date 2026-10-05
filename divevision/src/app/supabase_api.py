@@ -148,24 +148,38 @@ def create_photo(
         return True
 
 
-def get_photo(photo_id: str, user_id: str | None = None) -> dict | None:
-    """Fetch a photos row, optionally only if it belongs to `user_id`.
+class PhotoLookupError(Exception):
+    """Reading a photos row failed, so whether it exists is unknown."""
 
-    The admin client bypasses RLS, so callers acting for a user must pass
-    `user_id` to keep the owner check.
+
+def _photo_query(photo_id: str):
+    return get_admin_client().table("photos").select("*").eq("id", photo_id)
+
+
+def find_photo(photo_id: str) -> dict | None:
+    """Fetch a photos row for the worker, regardless of owner.
+
+    Returns None only when the row is confirmed missing; raises
+    `PhotoLookupError` when the lookup itself fails.
     """
     try:
-        query = get_admin_client().table("photos").select("*").eq("id", photo_id)
-        if user_id is not None:
-            query = query.eq("user_id", user_id)
-        response = query.execute()
+        response = _photo_query(photo_id).execute()
+    except _POSTGREST_ERRORS as e:
+        raise PhotoLookupError(photo_id) from e
+    return response.data[0] if response.data else None
+
+
+def get_photo(photo_id: str, user_id: str) -> dict | None:
+    """Fetch a photos row only if it belongs to `user_id`, else None.
+
+    The admin client bypasses RLS, so this owner filter is the access check.
+    """
+    try:
+        response = _photo_query(photo_id).eq("user_id", user_id).execute()
     except _POSTGREST_ERRORS as e:
         logger.error(e)
         return None
-
-    if not response.data:
-        return None
-    return response.data[0]
+    return response.data[0] if response.data else None
 
 
 def _update_photo(photo_id: str, values: dict) -> bool:

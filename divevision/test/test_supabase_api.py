@@ -169,18 +169,31 @@ def test_get_photo_scoped_to_owner(mock_admin_client):
     query.eq.assert_called_once_with("user_id", "user-123")
 
 
-def test_get_photo_unscoped_for_worker(mock_admin_client):
+def test_get_photo_none_on_postgrest_error(mock_admin_client):
+    query = mock_admin_client.table.return_value.select.return_value.eq.return_value
+    query.eq.return_value.execute.side_effect = _postgrest_error()
+    assert supabase_api.get_photo("photo-1", user_id="user-123") is None
+
+
+def test_find_photo_unscoped_for_worker(mock_admin_client):
     query = mock_admin_client.table.return_value.select.return_value.eq.return_value
     query.execute.return_value = SimpleNamespace(data=[{"id": "photo-1"}])
 
-    assert supabase_api.get_photo("photo-1") == {"id": "photo-1"}
+    assert supabase_api.find_photo("photo-1") == {"id": "photo-1"}
     query.eq.assert_not_called()
 
 
-def test_get_photo_not_found(mock_admin_client):
+def test_find_photo_not_found(mock_admin_client):
     query = mock_admin_client.table.return_value.select.return_value.eq.return_value
     query.execute.return_value = SimpleNamespace(data=[])
-    assert supabase_api.get_photo("photo-1") is None
+    assert supabase_api.find_photo("photo-1") is None
+
+
+def test_find_photo_raises_on_postgrest_error(mock_admin_client):
+    query = mock_admin_client.table.return_value.select.return_value.eq.return_value
+    query.execute.side_effect = _postgrest_error()
+    with pytest.raises(supabase_api.PhotoLookupError):
+        supabase_api.find_photo("photo-1")
 
 
 def _update_call(mock_admin_client, data):
@@ -226,7 +239,7 @@ def test_delete_photo_removes_objects_and_row(mock_admin_client, monkeypatch):
     monkeypatch.setattr(
         supabase_api,
         "get_photo",
-        lambda photo_id, user_id=None: {
+        lambda photo_id, user_id: {
             "id": photo_id,
             "original_path": "user-123/a.jpg",
             "processed_path": "user-123/a.png",
@@ -255,7 +268,7 @@ def test_delete_photo_checks_owner(mock_admin_client, monkeypatch):
     monkeypatch.setattr(
         supabase_api,
         "get_photo",
-        lambda photo_id, user_id=None: seen.append(user_id),
+        lambda photo_id, user_id: seen.append(user_id),
     )
     assert supabase_api.delete_photo("photo-1", "user-b") is False
     assert seen == ["user-b"]

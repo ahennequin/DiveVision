@@ -2,6 +2,7 @@ import asyncio
 import io
 
 import pytest
+from arq.worker import Retry
 from PIL import Image
 
 from divevision.src.app import enhancement, supabase_api, worker
@@ -64,7 +65,7 @@ def photos(monkeypatch):
         return True
 
     monkeypatch.setattr(
-        supabase_api, "get_photo", lambda photo_id: state["rows"].get(photo_id)
+        supabase_api, "find_photo", lambda photo_id: state["rows"].get(photo_id)
     )
     monkeypatch.setattr(
         supabase_api,
@@ -159,6 +160,48 @@ def test_process_photo_removes_output_when_photo_deleted_mid_job(photos, monkeyp
     assert (supabase_api.PROCESSED_IMAGES_BUCKET, PROCESSED_PATH) not in photos[
         "objects"
     ]
+
+
+def _failing_lookup(photo_id):
+    raise supabase_api.PhotoLookupError(photo_id)
+
+
+def test_process_photo_retries_when_lookup_fails(photos, monkeypatch):
+    monkeypatch.setattr(supabase_api, "find_photo", _failing_lookup)
+    model = FakeModel()
+
+    with pytest.raises(Retry):
+        worker.process_photo(model, PHOTO_ID)
+    assert model.inputs == []
+    assert photos["statuses"] == []
+
+
+def test_process_photo_keeps_output_when_completion_and_lookup_fail(
+    photos, monkeypatch
+):
+    def completion_fails_then_lookup_fails(photo_id, processed_path):
+        monkeypatch.setattr(supabase_api, "find_photo", _failing_lookup)
+        return False
+
+    monkeypatch.setattr(
+        supabase_api, "mark_photo_completed", completion_fails_then_lookup_fails
+    )
+
+    assert worker.process_photo(FakeModel(), PHOTO_ID) == "failed"
+    assert photos["statuses"] == ["processing", "failed"]
+    assert (supabase_api.PROCESSED_IMAGES_BUCKET, PROCESSED_PATH) in photos["objects"]
+
+
+def test_process_photo_marks_failed_when_completion_fails_for_existing_row(
+    photos, monkeypatch
+):
+    monkeypatch.setattr(
+        supabase_api, "mark_photo_completed", lambda photo_id, processed_path: False
+    )
+
+    assert worker.process_photo(FakeModel(), PHOTO_ID) == "failed"
+    assert photos["statuses"] == ["processing", "failed"]
+    assert (supabase_api.PROCESSED_IMAGES_BUCKET, PROCESSED_PATH) in photos["objects"]
 
 
 def test_enhance_photo_job_uses_model_loaded_at_startup(photos, monkeypatch):
