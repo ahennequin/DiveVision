@@ -75,8 +75,9 @@ Original, inserts a `pending` row, and enqueues `enhance_photo` with the photo i
 id; the worker marks the row `processing`, then `completed` or `failed`. `POST /leaderboard/`
 is a separate, non-user-auth path gated by a shared secret (`LEADERBOARD_SHARED_SECRET`,
 `X-Leaderboard-Secret` header) for a local MLflow benchmark script. `DELETE /account/` relies on
-`photos.user_id`'s `ON DELETE CASCADE` FK to clean up rows once the auth user is deleted - it
-only needs to explicitly remove storage objects first.
+`photos.user_id`'s `ON DELETE CASCADE` FK to clean up rows once the auth user is deleted, then
+removes storage objects. Both photo and account deletion drop rows before objects, so an in-flight
+job fails to complete and removes its own Enhanced Image.
 
 ## Maintaining this file
 

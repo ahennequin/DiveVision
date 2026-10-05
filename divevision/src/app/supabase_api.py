@@ -237,25 +237,28 @@ def delete_photo_row(photo_id: str) -> bool:
 
 
 def delete_photo(photo_id: str, user_id: str) -> bool:
-    """Delete one of `user_id`'s photos: both storage objects, then its row.
+    """Delete one of `user_id`'s photos: its row, then both storage objects.
 
-    Returns False if the photo does not exist or belongs to someone else.
+    The row goes first so an in-flight Enhancement Job fails to complete it
+    and removes its own output. Returns False if the photo does not exist,
+    belongs to someone else, or its row could not be deleted.
     """
     photo = get_photo(photo_id, user_id=user_id)
-    if photo is None:
+    if photo is None or not delete_photo_row(photo_id):
         return False
 
     _delete_photo_objects([photo])
-    return delete_photo_row(photo_id)
+    return True
 
 
 def delete_account(user_id: str) -> bool:
-    """Erase a user: every photo's storage objects, then the auth user itself.
+    """Erase a user: the auth user itself, then every photo's storage objects.
 
     Deleting the auth user cascades (via the `photos.user_id` foreign key)
-    to remove every remaining `photos` row, so rows do not need to be
-    deleted one by one here - only the storage objects, which have no such
-    cascade.
+    to remove every `photos` row, so rows do not need to be deleted one by
+    one here - only the storage objects, which have no such cascade. Their
+    paths are read first, and the rows go before the objects so an in-flight
+    Enhancement Job fails to complete and removes its own output.
     """
     client = get_admin_client()
     photos: list[dict] = []
@@ -277,15 +280,14 @@ def delete_account(user_id: str) -> bool:
         logger.error(e)
         return False
 
-    _delete_photo_objects(photos)
-
     try:
         client.auth.admin.delete_user(user_id)
     except _AUTH_ERRORS as e:
         logger.error(e)
         return False
-    else:
-        return True
+
+    _delete_photo_objects(photos)
+    return True
 
 
 # -- leaderboard -------------------------------------------------------------------

@@ -170,7 +170,7 @@ async def delete_photo(
 async def delete_account(
     user_id: Annotated[str, Depends(current_user_id)],
 ):
-    """Erase the caller's account: every photo (storage + row), then the auth user."""
+    """Erase the caller's account: the auth user (cascading rows), then storage."""
     if not supabase_api.delete_account(user_id):
         raise HTTPException(status_code=400, detail="Could not delete account")
     return Response(status_code=204)

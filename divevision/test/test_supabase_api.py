@@ -267,6 +267,38 @@ def test_delete_photo_removes_objects_and_row(mock_admin_client, monkeypatch):
             "processed_path": "user-123/a.png",
         },
     )
+    calls = []
+    monkeypatch.setattr(
+        supabase_api,
+        "delete_photo_row",
+        lambda photo_id: calls.append(("row", photo_id)) or True,
+    )
+    monkeypatch.setattr(
+        supabase_api,
+        "delete_images",
+        lambda bucket, paths: calls.append((bucket, paths)) or True,
+    )
+
+    assert supabase_api.delete_photo("photo-1", "user-123") is True
+
+    assert calls == [
+        ("row", "photo-1"),
+        (supabase_api.IMAGES_BUCKET, ["user-123/a.jpg"]),
+        (supabase_api.PROCESSED_IMAGES_BUCKET, ["user-123/a.png"]),
+    ]
+
+
+def test_delete_photo_keeps_objects_when_row_delete_fails(monkeypatch):
+    monkeypatch.setattr(
+        supabase_api,
+        "get_photo",
+        lambda photo_id, user_id: {
+            "id": photo_id,
+            "original_path": "user-123/a.jpg",
+            "processed_path": "user-123/a.png",
+        },
+    )
+    monkeypatch.setattr(supabase_api, "delete_photo_row", lambda photo_id: False)
     deleted = []
     monkeypatch.setattr(
         supabase_api,
@@ -274,15 +306,8 @@ def test_delete_photo_removes_objects_and_row(mock_admin_client, monkeypatch):
         lambda bucket, paths: deleted.append((bucket, paths)) or True,
     )
 
-    assert supabase_api.delete_photo("photo-1", "user-123") is True
-
-    assert deleted == [
-        (supabase_api.IMAGES_BUCKET, ["user-123/a.jpg"]),
-        (supabase_api.PROCESSED_IMAGES_BUCKET, ["user-123/a.png"]),
-    ]
-    mock_admin_client.table.return_value.delete.return_value.eq.assert_called_once_with(
-        "id", "photo-1"
-    )
+    assert supabase_api.delete_photo("photo-1", "user-123") is False
+    assert deleted == []
 
 
 def test_delete_photo_removes_enhanced_image_without_processed_path(
@@ -343,11 +368,14 @@ def test_delete_account_removes_photos_and_auth_user(mock_admin_client, monkeypa
             data=[{"original_path": "user-123/c.png", "processed_path": None}]
         ),
     ]
-    deleted = []
+    calls = []
+    mock_admin_client.auth.admin.delete_user.side_effect = lambda user_id: calls.append(
+        ("user", user_id)
+    )
     monkeypatch.setattr(
         supabase_api,
         "delete_images",
-        lambda bucket, paths: deleted.append((bucket, paths)) or True,
+        lambda bucket, paths: calls.append((bucket, paths)) or True,
     )
 
     assert supabase_api.delete_account("user-123") is True
@@ -355,7 +383,8 @@ def test_delete_account_removes_photos_and_auth_user(mock_admin_client, monkeypa
     eq = mock_admin_client.table.return_value.select.return_value.eq
     assert {c.args for c in eq.call_args_list} == {("user_id", "user-123")}
     assert [c.args for c in query.range.call_args_list] == [(0, 1), (2, 3)]
-    assert deleted == [
+    assert calls == [
+        ("user", "user-123"),
         (
             supabase_api.IMAGES_BUCKET,
             ["user-123/a.jpg", "user-123/b.jpg", "user-123/c.png"],
@@ -365,7 +394,6 @@ def test_delete_account_removes_photos_and_auth_user(mock_admin_client, monkeypa
             ["user-123/a.png", "user-123/b.png", "user-123/c.png"],
         ),
     ]
-    mock_admin_client.auth.admin.delete_user.assert_called_once_with("user-123")
 
 
 def test_delete_account_aborts_when_photos_unreadable(mock_admin_client):
@@ -377,15 +405,24 @@ def test_delete_account_aborts_when_photos_unreadable(mock_admin_client):
     mock_admin_client.auth.admin.delete_user.assert_not_called()
 
 
-def test_delete_account_admin_delete_failure(mock_admin_client):
+def test_delete_account_admin_delete_failure(mock_admin_client, monkeypatch):
     query = (
         mock_admin_client.table.return_value.select.return_value.eq.return_value.order.return_value
     )
-    query.range.return_value.execute.return_value = SimpleNamespace(data=[])
+    query.range.return_value.execute.return_value = SimpleNamespace(
+        data=[{"original_path": "user-123/a.jpg", "processed_path": None}]
+    )
     mock_admin_client.auth.admin.delete_user.side_effect = supabase.AuthApiError(
         message="boom", status=500, code=None
     )
+    deleted = []
+    monkeypatch.setattr(
+        supabase_api,
+        "delete_images",
+        lambda bucket, paths: deleted.append((bucket, paths)) or True,
+    )
     assert supabase_api.delete_account("user-123") is False
+    assert deleted == []
 
 
 # -- leaderboard -------------------------------------------------------------------
