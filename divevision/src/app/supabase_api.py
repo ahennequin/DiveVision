@@ -17,6 +17,12 @@ SUPABASE_SERVICE_ROLE_KEY: str = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 IMAGES_BUCKET = "images"
 PROCESSED_IMAGES_BUCKET = "processedimages"
 
+
+def processed_path_for(original_path: str) -> str:
+    """`<user_id>/<photo_id>.<ext>` -> `<user_id>/<photo_id>.png`."""
+    return original_path.rsplit(".", 1)[0] + ".png"
+
+
 # PostgREST's `max_rows` (supabase/config.toml) and Storage's per-request
 # remove limit are both 1000.
 _PAGE_SIZE = 1000
@@ -116,14 +122,16 @@ def delete_images(bucket: str, paths: list[str]) -> bool:
 
 
 def _delete_photo_objects(photos: list[dict]) -> None:
-    """Best-effort removal of the original and enhanced objects of `photos`."""
-    delete_images(
-        IMAGES_BUCKET, [p["original_path"] for p in photos if p["original_path"]]
-    )
-    delete_images(
-        PROCESSED_IMAGES_BUCKET,
-        [p["processed_path"] for p in photos if p["processed_path"]],
-    )
+    """Best-effort removal of the original and enhanced objects of `photos`.
+
+    The enhanced object is also removed at its derived path, since the worker
+    uploads it before `processed_path` is recorded on the row.
+    """
+    originals = [p["original_path"] for p in photos if p["original_path"]]
+    delete_images(IMAGES_BUCKET, originals)
+    processed = {processed_path_for(path) for path in originals}
+    processed.update(p["processed_path"] for p in photos if p["processed_path"])
+    delete_images(PROCESSED_IMAGES_BUCKET, sorted(processed))
 
 
 # -- photos table ----------------------------------------------------------------

@@ -285,6 +285,33 @@ def test_delete_photo_removes_objects_and_row(mock_admin_client, monkeypatch):
     )
 
 
+def test_delete_photo_removes_enhanced_image_without_processed_path(
+    mock_admin_client, monkeypatch
+):
+    monkeypatch.setattr(
+        supabase_api,
+        "get_photo",
+        lambda photo_id, user_id: {
+            "id": photo_id,
+            "original_path": "user-123/a.jpg",
+            "processed_path": None,
+        },
+    )
+    deleted = []
+    monkeypatch.setattr(
+        supabase_api,
+        "delete_images",
+        lambda bucket, paths: deleted.append((bucket, paths)) or True,
+    )
+
+    assert supabase_api.delete_photo("photo-1", "user-123") is True
+
+    assert deleted == [
+        (supabase_api.IMAGES_BUCKET, ["user-123/a.jpg"]),
+        (supabase_api.PROCESSED_IMAGES_BUCKET, ["user-123/a.png"]),
+    ]
+
+
 def test_delete_photo_checks_owner(mock_admin_client, monkeypatch):
     seen = []
     monkeypatch.setattr(
@@ -333,7 +360,10 @@ def test_delete_account_removes_photos_and_auth_user(mock_admin_client, monkeypa
             supabase_api.IMAGES_BUCKET,
             ["user-123/a.jpg", "user-123/b.jpg", "user-123/c.png"],
         ),
-        (supabase_api.PROCESSED_IMAGES_BUCKET, ["user-123/a.png"]),
+        (
+            supabase_api.PROCESSED_IMAGES_BUCKET,
+            ["user-123/a.png", "user-123/b.png", "user-123/c.png"],
+        ),
     ]
     mock_admin_client.auth.admin.delete_user.assert_called_once_with("user-123")
 

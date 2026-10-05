@@ -29,11 +29,6 @@ RETRY_BASE_DELAY = 10
 RETRY_MAX_DELAY = 300
 
 
-def processed_path_for(original_path: str) -> str:
-    """`<user_id>/<photo_id>.<ext>` -> `<user_id>/<photo_id>.png`."""
-    return original_path.rsplit(".", 1)[0] + ".png"
-
-
 def retry_delay(job_try: int) -> int:
     return min(RETRY_BASE_DELAY * 2 ** (job_try - 1), RETRY_MAX_DELAY)
 
@@ -84,7 +79,7 @@ def process_photo(model, photo_id: str, job_try: int = 1) -> str:
 
         enhanced = enhance_image(model, original)
 
-        processed_path = processed_path_for(photo["original_path"])
+        processed_path = supabase_api.processed_path_for(photo["original_path"])
         if not supabase_api.upload_image(
             enhanced,
             supabase_api.PROCESSED_IMAGES_BUCKET,

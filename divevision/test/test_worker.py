@@ -249,6 +249,20 @@ def test_process_photo_retries_when_completion_fails_then_completes(
     assert len(model.inputs) == 2
 
 
+def _delete_photo_via_api(photos, monkeypatch):
+    monkeypatch.setattr(
+        supabase_api,
+        "get_photo",
+        lambda photo_id, user_id: photos["rows"].get(photo_id),
+    )
+    monkeypatch.setattr(
+        supabase_api,
+        "delete_photo_row",
+        lambda photo_id: photos["rows"].pop(photo_id, None) is not None,
+    )
+    return supabase_api.delete_photo(PHOTO_ID, "user-123")
+
+
 def test_process_photo_marks_failed_when_completion_fails_on_last_try(
     photos, monkeypatch
 ):
@@ -258,7 +272,25 @@ def test_process_photo_marks_failed_when_completion_fails_on_last_try(
 
     assert worker.process_photo(FakeModel(), PHOTO_ID, worker.MAX_TRIES) == "failed"
     assert photos["statuses"] == ["processing", "failed"]
+    assert photos["rows"][PHOTO_ID]["processed_path"] is None
+
+    assert _delete_photo_via_api(photos, monkeypatch) is True
+    assert photos["objects"] == {}
+
+
+def test_deleting_photo_during_completion_retry_leaves_no_enhanced_image(
+    photos, monkeypatch
+):
+    monkeypatch.setattr(
+        supabase_api, "mark_photo_completed", lambda photo_id, processed_path: False
+    )
+    with pytest.raises(Retry):
+        worker.process_photo(FakeModel(), PHOTO_ID, 1)
     assert (supabase_api.PROCESSED_IMAGES_BUCKET, PROCESSED_PATH) in photos["objects"]
+
+    assert _delete_photo_via_api(photos, monkeypatch) is True
+    assert photos["objects"] == {}
+    assert worker.process_photo(FakeModel(), PHOTO_ID, 2) == "skipped"
 
 
 def test_process_photo_retries_when_failed_status_cannot_be_written(
