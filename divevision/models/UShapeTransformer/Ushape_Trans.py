@@ -19,8 +19,7 @@ from torch.nn import Conv2d, LeakyReLU, ModuleList
 from .block import *
 from .block import _equalized_conv2d
 from .CMSFFT import ChannelTransformer
-from .PositionalEncoding import (FixedPositionalEncoding,
-                                 LearnedPositionalEncoding)
+from .PositionalEncoding import FixedPositionalEncoding, LearnedPositionalEncoding
 from .SGFMT import TransformerModel
 
 

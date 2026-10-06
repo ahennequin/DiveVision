@@ -2,10 +2,12 @@ from typing import List, Tuple
 
 import torch
 
-from divevision.models.CEVAE.modules.autoencoder.common import (AttnBlock,
-                                                                Normalize,
-                                                                ResnetBlock,
-                                                                nonlinearity)
+from divevision.models.CEVAE.modules.autoencoder.common import (
+    AttnBlock,
+    Normalize,
+    ResnetBlock,
+    nonlinearity,
+)
 
 
 class Downsample(torch.nn.Module):
