@@ -64,6 +64,25 @@ describe('useMyPhotos', () => {
     expect(result.current.photos).toEqual(rows.filter((p) => p !== deleted));
     expect(result.current.hasMore).toBe(false);
   });
+
+  it('keeps a status change caught up on reconnect when Load more runs concurrently', async () => {
+    const rows = Array.from({ length: PAGE_SIZE + 6 }, (_, i) =>
+      makePhoto({ id: `dddddddd-0000-4000-8000-${String(i).padStart(12, '0')}` }),
+    );
+    mockSupabase = fakeSupabase(rows.slice());
+    const { result } = await renderHook(() => useMyPhotos(USER_ID));
+    await waitFor(() => expect(result.current.photos).toHaveLength(PAGE_SIZE));
+
+    const completed = { ...rows[0], status: 'completed' as const };
+    mockSupabase.rows[0] = completed;
+    await act(async () => {
+      mockSupabase.connect();
+      result.current.loadMore();
+    });
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    expect(result.current.photos).toEqual([completed, ...rows.slice(1)]);
+  });
 });
 
 describe('usePhoto', () => {

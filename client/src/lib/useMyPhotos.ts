@@ -29,7 +29,8 @@ export function useMyPhotos(userId: string): MyPhotos {
   const [error, setError] = useState<string | null>(null);
   const [hasMore, setHasMore] = useState(false);
   const loaded = useRef(0);
-  const request = useRef(0);
+  const refreshRequest = useRef(0);
+  const pageRequest = useRef(0);
 
   useEffect(() => {
     loaded.current = photos.length;
@@ -46,30 +47,30 @@ export function useMyPhotos(userId: string): MyPhotos {
 
   /** Reload everything shown so far (at least one page), in the background. */
   const refresh = useCallback(() => {
-    const id = ++request.current;
+    const id = ++refreshRequest.current;
     const limit = Math.max(loaded.current, PAGE_SIZE);
     fetchPage(0, limit)
       .then(({ page, urls }) => {
-        if (id !== request.current) return;
+        if (id !== refreshRequest.current) return;
         setPhotos(page);
         setThumbnails(urls);
         setHasMore(page.length === limit);
         setError(null);
       })
       .catch((e: Error) => {
-        if (id === request.current) setError(e.message);
+        if (id === refreshRequest.current) setError(e.message);
       })
       .finally(() => {
-        if (id === request.current) setLoading(false);
+        if (id === refreshRequest.current) setLoading(false);
       });
   }, [fetchPage]);
 
   const loadMore = useCallback(() => {
-    const id = ++request.current;
+    const id = ++pageRequest.current;
     setLoading(true);
     fetchPage(loaded.current, PAGE_SIZE)
       .then(({ page, urls }) => {
-        if (id !== request.current) return;
+        if (id !== pageRequest.current) return;
         setPhotos((current) => {
           const known = new Set(current.map((p) => p.id));
           return [...current, ...page.filter((p) => !known.has(p.id))];
@@ -79,10 +80,10 @@ export function useMyPhotos(userId: string): MyPhotos {
         setError(null);
       })
       .catch((e: Error) => {
-        if (id === request.current) setError(e.message);
+        if (id === pageRequest.current) setError(e.message);
       })
       .finally(() => {
-        if (id === request.current) setLoading(false);
+        if (id === pageRequest.current) setLoading(false);
       });
   }, [fetchPage]);
 
