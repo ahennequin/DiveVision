@@ -49,7 +49,7 @@ jobs:
     # Lint
     - name: Lint with Black
       run: |
-        poetry run black .
+        poetry run black --check --diff .
     # Test
     - name: Test with pytest
       run: |
