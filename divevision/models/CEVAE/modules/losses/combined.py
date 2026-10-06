@@ -7,7 +7,9 @@ from pytorch_msssim import ms_ssim
 from torchmetrics.functional.image import image_gradients
 
 from divevision.models.CEVAE.modules.discriminator.patchgan import (
-    PatchGANDiscriminator, weights_init)
+    PatchGANDiscriminator,
+    weights_init,
+)
 from divevision.models.CEVAE.util import rank_zero_log_only
 
 from .lpips import LPIPS
