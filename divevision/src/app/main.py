@@ -55,6 +55,17 @@ class PhotoCreated(BaseModel):
     status: Literal["pending"]
 
 
+class ErrorDetail(BaseModel):
+    """Body of every error response (FastAPI's `HTTPException` shape)."""
+
+    detail: str
+
+
+def _errors(*status_codes: int) -> dict[int | str, dict]:
+    """Declare error responses so the generated client types them."""
+    return {code: {"model": ErrorDetail} for code in status_codes}
+
+
 class LeaderboardEntry(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
 
@@ -114,7 +125,12 @@ def _sniff_image(contents: bytes) -> tuple[str, str]:
     return ACCEPTED_FORMATS[image_format]
 
 
-@app.post("/photos/", status_code=202, response_model=PhotoCreated)
+@app.post(
+    "/photos/",
+    status_code=202,
+    response_model=PhotoCreated,
+    responses=_errors(400, 401, 413, 502, 503),
+)
 async def upload_photo(
     user_id: Annotated[str, Depends(current_user_id)],
     queue: Annotated[ArqRedis, Depends(get_queue)],
@@ -155,7 +171,7 @@ async def upload_photo(
     return PhotoCreated(id=uuid.UUID(photo_id), status="pending")
 
 
-@app.delete("/photos/{photo_id}/", status_code=204)
+@app.delete("/photos/{photo_id}/", status_code=204, responses=_errors(401, 404))
 async def delete_photo(
     photo_id: uuid.UUID,
     user_id: Annotated[str, Depends(current_user_id)],
@@ -166,7 +182,7 @@ async def delete_photo(
     return Response(status_code=204)
 
 
-@app.delete("/account/", status_code=204)
+@app.delete("/account/", status_code=204, responses=_errors(400, 401))
 async def delete_account(
     user_id: Annotated[str, Depends(current_user_id)],
 ):

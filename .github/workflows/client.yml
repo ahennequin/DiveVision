@@ -1,0 +1,68 @@
+# Lint, type-check and test the Expo client (client/), and fail when its
+# generated API types are stale. (client/openapi.json itself is checked against
+# the FastAPI app by the Python workflow's pytest run.)
+
+name: Client
+
+on:
+  push:
+    branches: [ "dev" ]
+  pull_request:
+    branches: [ "dev" ]
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: client
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 24
+        cache: npm
+        cache-dependency-path: client/package-lock.json
+    - run: npm ci
+    - run: npm run lint
+
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 24
+        cache: npm
+        cache-dependency-path: client/package-lock.json
+    - run: npm ci
+    - run: npm run typecheck
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 24
+        cache: npm
+        cache-dependency-path: client/package-lock.json
+    - run: npm ci
+    - run: npm test -- --ci
+
+  api-client:
+    name: API client is current
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 24
+        cache: npm
+        cache-dependency-path: client/package-lock.json
+    - run: npm ci
+    - run: npm run api:check
