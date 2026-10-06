@@ -32,6 +32,7 @@ export function fakeSupabase(rows: Photo[] = []) {
   const signed: { bucket: string; paths: string[] }[] = [];
   let listeners: ((change: PhotoChange) => void)[] = [];
   let subscribedCallbacks: ((status: string) => void)[] = [];
+  let gate: Promise<void> = Promise.resolve();
 
   const query = () => {
     const applied: [string, unknown][] = [];
@@ -45,10 +46,10 @@ export function fakeSupabase(rows: Photo[] = []) {
         applied.push([column, value]);
         return builder;
       },
-      range: async (from: number, to: number) => ({
-        data: matching().slice(from, to + 1),
-        error: null,
-      }),
+      range: async (from: number, to: number) => {
+        await gate;
+        return { data: matching().slice(from, to + 1), error: null };
+      },
       maybeSingle: async () => ({ data: matching()[0] ?? null, error: null }),
     };
     return builder;
@@ -106,6 +107,14 @@ export function fakeSupabase(rows: Photo[] = []) {
       listeners.forEach((listener) => listener(change as PhotoChange)),
     /** Report every channel as connected. */
     connect: () => subscribedCallbacks.forEach((cb) => cb('SUBSCRIBED')),
+    /** Hold every `photos` page query until the returned release is called. */
+    hold: () => {
+      let release = () => {};
+      gate = new Promise((resolve) => {
+        release = resolve;
+      });
+      return release;
+    },
     get subscriptions() {
       return listeners.length;
     },

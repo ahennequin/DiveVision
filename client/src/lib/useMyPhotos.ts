@@ -28,13 +28,15 @@ export function useMyPhotos(userId: string): MyPhotos {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [hasMore, setHasMore] = useState(false);
-  const loaded = useRef(0);
-  const refreshRequest = useRef(0);
-  const pageRequest = useRef(0);
+  const shown = useRef<Photo[]>([]);
+  const queue = useRef<Promise<void>>(Promise.resolve());
+  const queued = useRef(0);
+  const generation = useRef(0);
 
-  useEffect(() => {
-    loaded.current = photos.length;
-  }, [photos]);
+  const update = useCallback((change: (current: Photo[]) => Photo[]) => {
+    shown.current = change(shown.current);
+    setPhotos(shown.current);
+  }, []);
 
   const fetchPage = useCallback(
     async (offset: number, limit: number) => {
@@ -45,55 +47,59 @@ export function useMyPhotos(userId: string): MyPhotos {
     [userId],
   );
 
+  /** Run gallery fetches one at a time, each against the list the previous one left. */
+  const enqueue = useCallback((run: (isCurrent: () => boolean) => Promise<void>) => {
+    const gen = generation.current;
+    const isCurrent = () => gen === generation.current;
+    queued.current += 1;
+    queue.current = queue.current
+      .then(() => (isCurrent() ? run(isCurrent) : undefined))
+      .catch((e: Error) => {
+        if (isCurrent()) setError(e.message);
+      })
+      .finally(() => {
+        queued.current -= 1;
+        if (queued.current === 0) setLoading(false);
+      });
+  }, []);
+
   /** Reload everything shown so far (at least one page), in the background. */
-  const refresh = useCallback(() => {
-    const id = ++refreshRequest.current;
-    const limit = Math.max(loaded.current, PAGE_SIZE);
-    fetchPage(0, limit)
-      .then(({ page, urls }) => {
-        if (id !== refreshRequest.current) return;
-        setPhotos(page);
+  const refresh = useCallback(
+    () =>
+      enqueue(async (isCurrent) => {
+        const limit = Math.max(shown.current.length, PAGE_SIZE);
+        const { page, urls } = await fetchPage(0, limit);
+        if (!isCurrent()) return;
+        update(() => page);
         setThumbnails(urls);
         setHasMore(page.length === limit);
         setError(null);
-      })
-      .catch((e: Error) => {
-        if (id === refreshRequest.current) setError(e.message);
-      })
-      .finally(() => {
-        if (id === refreshRequest.current) setLoading(false);
-      });
-  }, [fetchPage]);
+      }),
+    [enqueue, fetchPage, update],
+  );
 
   const loadMore = useCallback(() => {
-    const id = ++pageRequest.current;
     setLoading(true);
-    fetchPage(loaded.current, PAGE_SIZE)
-      .then(({ page, urls }) => {
-        if (id !== pageRequest.current) return;
-        setPhotos((current) => {
-          const known = new Set(current.map((p) => p.id));
-          return [...current, ...page.filter((p) => !known.has(p.id))];
-        });
-        setThumbnails((current) => ({ ...current, ...urls }));
-        setHasMore(page.length === PAGE_SIZE);
-        setError(null);
-      })
-      .catch((e: Error) => {
-        if (id === pageRequest.current) setError(e.message);
-      })
-      .finally(() => {
-        if (id === pageRequest.current) setLoading(false);
+    enqueue(async (isCurrent) => {
+      const { page, urls } = await fetchPage(shown.current.length, PAGE_SIZE);
+      if (!isCurrent()) return;
+      update((current) => {
+        const known = new Set(current.map((p) => p.id));
+        return [...current, ...page.filter((p) => !known.has(p.id))];
       });
-  }, [fetchPage]);
+      setThumbnails((current) => ({ ...current, ...urls }));
+      setHasMore(page.length === PAGE_SIZE);
+      setError(null);
+    });
+  }, [enqueue, fetchPage, update]);
 
   useEffect(() => {
     refresh();
-    return subscribeToMyPhotos(
+    const unsubscribe = subscribeToMyPhotos(
       getSupabase(),
       userId,
       (change) => {
-        setPhotos((current) => applyPhotoChange(current, userId, change));
+        update((current) => applyPhotoChange(current, userId, change));
         if (change.eventType !== 'DELETE' && change.new.user_id === userId) {
           // A new row, or a completed one, needs a (new) thumbnail URL.
           signThumbnails(getSupabase(), userId, [change.new])
@@ -104,14 +110,18 @@ export function useMyPhotos(userId: string): MyPhotos {
       // Catch up on anything that changed before the channel was (re)connected.
       refresh,
     );
-  }, [userId, refresh]);
+    return () => {
+      generation.current += 1;
+      unsubscribe();
+    };
+  }, [userId, refresh, update]);
 
   useEffect(
     () =>
       onPhotoDeleted((photoId) => {
-        setPhotos((current) => current.filter((p) => p.id !== photoId));
+        update((current) => current.filter((p) => p.id !== photoId));
       }),
-    [],
+    [update],
   );
 
   return { photos, thumbnails, loading, error, hasMore, loadMore, refresh };
